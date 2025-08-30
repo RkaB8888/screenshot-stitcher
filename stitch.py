@@ -3,6 +3,8 @@ import os
 import re
 import sys
 from pathlib import Path
+import numpy as np
+import cv2
 
 
 def _natural_key(s: str):
@@ -31,6 +33,18 @@ def load_images(input_dir):
     paths = [str(f) for f in files]
     print(f"[INFO] 이미지 로드: {len(paths)}장")
     return paths
+
+
+def _read_cv_images(paths):
+    """경로 리스트 -> cv2 이미지 리스트 (BGRA 유지)"""
+    imgs = []
+    for p in paths:
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"[에러] cv2로 이미지 읽기 실패: {p}")
+            sys.exit(1)
+        imgs.append(img)
+    return imgs
 
 
 def trim_bezel():
@@ -72,12 +86,22 @@ def main():
         input_dir = os.path.join(script_dir, "images")
 
     # 2. 이미지 불러오기
+    # 해당 경로에 있는 모든 이미지 파일 경로 리스트
     image_files = load_images(input_dir)
-    print(image_files)
+    # 이미지 데이터(numpy arr) 리스트
+    imgs = _read_cv_images(image_files)
 
-    # 3. 각 이미지 베젤 제거
-    # 4. 겹침 영역 계산 반복
-    # 5. 이미지 이어붙이기
+    for i in range(len(imgs) - 1):
+        # 3. 겹침 영역 계산 반복
+        dx, dy, conf = find_overlap(imgs[i], imgs[i + 1])
+        print(
+            f"[OVERLAP] {Path(image_files[i]).name} -> {Path(image_files[i+1]).name} "
+            f"dx={dx}, dy={dy}, conf={conf:.3f}"
+        )
+        # 4. 이어붙인 이미지 베젤 제거
+
+        # 5. 이미지 이어붙이기
+
     # 6. 출력 저장
     pass
 
