@@ -47,19 +47,144 @@ def _read_cv_images(paths):
     return imgs
 
 
-def trim_bezel():
-    # TODO: 베젤 인식 및 잘라내기
-    return cropped_image
+def _to_gray_and_mask(img):
+    """
+    img: BGR 또는 BGRA (np.uint8)
+    반환: gray(H,W), valid_mask(H,W) (True=비교대상)
+    """
+
+    # ndim은 배열의 차원 수 (H,W) -> 2, (H,W,3) -> 3, (H,W,4) -> 3
+    # shape는 배열의 크기를 담은 튜플
+    # gray: shape == (H,W)
+    # color: shape == (H,W,3)
+    # BGRA: shape == (H,W,4)
+    if img.ndim == 2:  # gray
+        gray = img
+        valid = np.ones_like(gray, dtype=bool)
+        return gray, valid
+
+    if img.shape[2] == 4:  # BGRA
+        bgr = img[:, :, :3]  # :3은 BGR 채널만 취함 -> 알파 채널 제외
+        alpha = img[:, :, 3]  # 3은 알파 채널만 취함 -> BGR 채널 제외
+        gray = cv2.cvtColor(
+            bgr, cv2.COLOR_BGR2GRAY
+        )  # 0.299*R + 0.587*G + 0.114*B 가중합 (사람 시야 보정)
+        valid = alpha > 0
+        return gray, valid
+
+    else:  # BGR
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        valid = np.ones(gray.shape, dtype=bool)
+        return gray, valid
 
 
-def find_overlap():
-    # TODO: 두 이미지 겹침 영역 계산
-    return offset
+def _overlap_slices(H1, W1, H2, W2, dx, dy):
+    """
+    B를 A 위에 (dx, dy)만큼 이동했을 때 A/B의 겹침 슬라이스 계산.
+    좌표계: A 기준. (0,0) = 좌상단
+    """
+    # A에서의 겹침 영역 (H1, W1)
+    ax1 = max(0, dx)  # 좌상단 꼭짓점
+    ay1 = max(0, dy)  # 좌상단 꼭짓점
+    ax2 = min(W1, dx + W2)  # 우하단 꼭짓점
+    ay2 = min(H1, dy + H2)  # 우하단 꼭짓점
+
+    if ax1 >= ax2 or ay1 >= ay2:
+        return None
+
+    # B에서의 대응 영역 (ax, ay) 와 dx dy 차이가 남
+    ow = ax2 - ax1
+    oh = ay2 - ay1
+    bx1 = ax1 - dx
+    by1 = ay1 - dy
+    bx2 = bx1 + ow
+    by2 = by1 + oh
+    return (slice(ay1, ay2), slice(ax1, ax2), slice(by1, by2), slice(bx1, bx2))
 
 
-def stitch_images():
-    # TODO: 모든 이미지 이어붙이기
-    return stitched
+def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
+    """
+    (dx,dy)에서의 일치도(confidence) 계산.
+    confidence = (abs(A-B)<=tol & 유효마스크)/유효겹침픽셀
+    """
+    H1, W1 = grayA.shape
+    H2, W2 = grayB.shape
+    sl = _overlap_slices(H1, W1, H2, W2, dx, dy)  # 슬라이스 인덱스 4개 반환
+    if sl is None:
+        return 0.0, 0
+
+    ay, ax, by, bx = sl
+    a = grayA[ay, ax]
+    b = grayB[by, bx]
+    v = validA[ay, ax] & validB[by, bx]  # 투명한지 체크
+    if not v.any():
+        return 0.0, 0
+
+    diff = cv2.absdiff(a, b)  # 절댓값 계산
+    match = (diff <= tol) & v  # 차이가 기준 이내이며 유효 픽셀인지
+    num_valid = int(v.sum())  # 비교한 유효 픽셀 갯수
+    num_match = int(match.sum())  # 유효 픽셀 중 기준에 적합한 갯수
+    conf = num_match / num_valid  # 비율 계산
+    return conf, num_valid
+
+
+def find_overlap(
+    imgA, imgB, max_shift_ratio=1, tol=5, coarse_stride=3, refine_window=6
+):
+    """
+    완전 브루트포스(거친탐색→정밀)로 (dx,dy,confidence) 찾기.
+    - imgA, imgB 크기 달라도 OK(배율만 동일 가정)
+    """
+    grayA, validA = _to_gray_and_mask(imgA)
+    grayB, validB = _to_gray_and_mask(imgB)
+
+    H1, W1 = grayA.shape  # gray는 2차원
+    H2, W2 = grayB.shape
+
+    # 탐색 한계: 각각의 크기에 비례 -> 겹치는 영역의 최대
+    max_dx = int(min(W1, W2) * max_shift_ratio)
+    max_dy = int(min(H1, H2) * max_shift_ratio)
+
+    best_conf = -1.0
+    best_dx = 0
+    best_dy = 0
+    best_valid = 0
+
+    # 1) 거친 탐색
+    for dy in range(-max_dy, max_dy + 1, coarse_stride):
+        for dx in range(-max_dx, max_dx + 1, coarse_stride):
+            conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
+            if (
+                conf > best_conf
+                or (conf == best_conf and num_valid > best_valid)
+                or (
+                    conf == best_conf
+                    and num_valid == best_valid
+                    and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
+                )
+            ):  # 일치울 > 유효 픽셀 수 > 더 적은 이동
+                best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
+
+    # 2) 정밀 탐색
+    dx1 = max(-max_dx, best_dx - refine_window)
+    dx2 = min(+max_dx, best_dx + refine_window)
+    dy1 = max(-max_dy, best_dy - refine_window)
+    dy2 = min(+max_dy, best_dy + refine_window)
+    for dy in range(dy1, dy2 + 1):
+        for dx in range(dx1, dx2 + 1):
+            conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
+            if (
+                conf > best_conf
+                or (conf == best_conf and num_valid > best_valid)
+                or (
+                    conf == best_conf
+                    and num_valid == best_valid
+                    and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
+                )
+            ):  # 일치울 > 유효 픽셀 수 > 더 적은 이동
+                best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
+
+    return int(best_dx), int(best_dy), float(best_conf)
 
 
 def parse_args():
