@@ -129,7 +129,7 @@ def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
 
 
 def find_overlap(
-    imgA, imgB, max_shift_ratio=1, tol=5, coarse_stride=3, refine_window=6
+    imgA, imgB, max_shift_ratio=1, tol=5, coarse_stride=1, refine_window=18
 ):
     """
     완전 브루트포스(거친탐색→정밀)로 (dx,dy,confidence) 찾기.
@@ -162,7 +162,7 @@ def find_overlap(
                     and num_valid == best_valid
                     and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
                 )
-            ):  # 일치울 > 유효 픽셀 수 > 더 적은 이동
+            ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
                 best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
 
     # 2) 정밀 탐색
@@ -181,10 +181,75 @@ def find_overlap(
                     and num_valid == best_valid
                     and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
                 )
-            ):  # 일치울 > 유효 픽셀 수 > 더 적은 이동
+            ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
                 best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
 
     return int(best_dx), int(best_dy), float(best_conf)
+
+
+def _ensure_bgra(img):
+    """입력(img: GRAY/BGR/BGRA)을 BGRA로 통일(알파=255)"""
+    if img.ndim == 2:
+        bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        a = np.full(img.shape, 255, np.uint8)
+        return np.dstack([bgr, a])
+    if img.shape[2] == 3:  # BGR
+        a = np.full(img.shape[:2], 255, np.uint8)
+        return np.dstack([img, a])
+    return img  # 이미 BGRA
+
+
+def _paste_bgra(canvas, src, x, y):
+    """src(bgra)를 canvas의 (x, y)에 클리핑해 덮어쓰기"""
+    Hc, Wc = canvas.shape[:2]  # canvas
+    Hs, Ws = src.shape[:2]  # src
+
+    # canvas 경계 내로 클리핑
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(Wc, x + Ws), min(Hc, y + Hs)
+    if x1 >= x2 or y1 >= y2:
+        return  # 만에 하나 겹침 없음
+
+    sx1, sy1 = x1 - x, y1 - y  # src를 기준으로 했을 때 좌상단 좌표
+    sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)  # src를 기준으로 했을 때 우하단 좌표
+
+    canvas[y1:y2, x1:x2, :3] = src[
+        sy1:sy2, sx1:sx2, :3
+    ]  # 덮어쓰기(추후에 베젤 관련 작업 예정)
+    canvas[y1:y2, x1:x2, 3] = 255  # 알파채널은 255로 통일
+
+
+def _accumulate_positions(imgs):
+    """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
+    positions = [(0, 0)]
+    for i in range(len(imgs) - 1):
+        print(f"[INFO] find_overlap start: {i} -> {i+1}")
+        dx, dy, conf = find_overlap(imgs[i], imgs[i + 1])
+        print(f"[INFO] find_overlap done : {i} -> {i+1}")
+        # print(f"[OVERLAP] {i}->{i+1} dx={dx}, dy={dy}, conf={conf:.3f}")
+        px, py = positions[-1]
+        positions.append((px + dx, py + dy))
+    return positions
+
+
+def _stitch_all(imgs, positions):
+    """절대좌표에 맞춰 모두 붙여 하나의 BGRA 반환"""
+    xs, ys = [], []
+    for img, (x, y) in zip(imgs, positions):
+        h, w = img.shape[:2]
+        xs += [x, x + w]
+        ys += [y, y + h]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    W = max_x - min_x
+    H = max_y - min_y
+    shift_x, shift_y = -min_x, -min_y
+
+    canvas = np.zeros((H, W, 4), dtype=np.uint8)
+    for img, (x, y) in zip(imgs, positions):
+        _paste_bgra(canvas, _ensure_bgra(img), x + shift_x, y + shift_y)
+    return canvas
 
 
 def parse_args():
@@ -216,18 +281,18 @@ def main():
     # 이미지 데이터(numpy arr) 리스트
     imgs = _read_cv_images(image_files)
 
-    for i in range(len(imgs) - 1):
-        # 3. 겹침 영역 계산 반복
-        dx, dy, conf = find_overlap(imgs[i], imgs[i + 1])
-        print(
-            f"[OVERLAP] {Path(image_files[i]).name} -> {Path(image_files[i+1]).name} "
-            f"dx={dx}, dy={dy}, conf={conf:.3f}"
-        )
-        # 4. 이어붙인 이미지 베젤 제거
+    # 3. 이미지 겹침 계산
+    positions = _accumulate_positions(imgs)
 
-        # 5. 이미지 이어붙이기
+    # 4. 이어 붙이기
+    stitched = _stitch_all(imgs, positions)
 
+    # 5. 이어붙인 이미지 베젤 제거
     # 6. 출력 저장
+    out_path = os.path.abspath(args.output)
+    cv2.imwrite(out_path, stitched)
+    print(f"[OK] saved -> {out_path}  size={stitched.shape[1]}x{stitched.shape[0]}")
+
     pass
 
 
