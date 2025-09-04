@@ -129,11 +129,17 @@ def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
 
 
 def find_overlap(
-    imgA, imgB, max_shift_ratio=1, tol=5, coarse_stride=1, refine_window=18
+    imgA,
+    imgB,
+    max_shift_ratio=1,
+    tol=5,
+    direction="both",
+    slack_frac=0.25,  # 흔들림 허용 비율 (기본 25%)
 ):
     """
     완전 브루트포스(거친탐색→정밀)로 (dx,dy,confidence) 찾기.
     - imgA, imgB 크기 달라도 OK(배율만 동일 가정)
+    direction이 'vertical'이면 dx에 ±slack, 'horizontal'이면 dy에 ±slack 허용.
     """
     grayA, validA = _to_gray_and_mask(imgA)
     grayB, validB = _to_gray_and_mask(imgB)
@@ -142,36 +148,35 @@ def find_overlap(
     H2, W2 = grayB.shape
 
     # 탐색 한계: 각각의 크기에 비례 -> 겹치는 영역의 최대
-    max_dx = int(min(W1, W2) * max_shift_ratio)
-    max_dy = int(min(H1, H2) * max_shift_ratio)
+    min_dx = int(-W2 * max_shift_ratio)
+    max_dx = int(W1 * max_shift_ratio)
+    min_dy = int(-H2 * max_shift_ratio)
+    max_dy = int(H1 * max_shift_ratio)
 
+    # ← 축 제한
+    if direction == "vertical":  # 가로 이동 제한
+        # 가로 정렬 범위(포함 정렬) ± 슬랙
+        nominal_min = min(0, W1 - W2)
+        nominal_max = max(0, W1 - W2)
+        slack = int(round(W2 * slack_frac))
+        min_dx = nominal_min - slack
+        max_dx = nominal_max + slack
+    elif direction == "horizontal":  # 세로 이동 제한
+        # 세로 정렬 범위(포함 정렬) ± 슬랙
+        nominal_min = min(0, H1 - H2)
+        nominal_max = max(0, H1 - H2)
+        slack = int(round(H2 * slack_frac))
+        min_dy = nominal_min - slack
+        max_dy = nominal_max + slack
+
+    # 탐색
     best_conf = -1.0
     best_dx = 0
     best_dy = 0
     best_valid = 0
 
-    # 1) 거친 탐색
-    for dy in range(-max_dy, max_dy + 1, coarse_stride):
-        for dx in range(-max_dx, max_dx + 1, coarse_stride):
-            conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
-            if (
-                conf > best_conf
-                or (conf == best_conf and num_valid > best_valid)
-                or (
-                    conf == best_conf
-                    and num_valid == best_valid
-                    and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
-                )
-            ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
-                best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
-
-    # 2) 정밀 탐색
-    dx1 = max(-max_dx, best_dx - refine_window)
-    dx2 = min(+max_dx, best_dx + refine_window)
-    dy1 = max(-max_dy, best_dy - refine_window)
-    dy2 = min(+max_dy, best_dy + refine_window)
-    for dy in range(dy1, dy2 + 1):
-        for dx in range(dx1, dx2 + 1):
+    for dy in range(min_dy, max_dy + 1):
+        for dx in range(min_dx, max_dx + 1):
             conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
             if (
                 conf > best_conf
@@ -219,14 +224,24 @@ def _paste_bgra(canvas, src, x, y):
     canvas[y1:y2, x1:x2, 3] = 255  # 알파채널은 255로 통일
 
 
-def _accumulate_positions(imgs):
+def _accumulate_positions(
+    imgs,
+    *,
+    direction,
+    max_shift_ratio,
+    tol,
+):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     positions = [(0, 0)]
     for i in range(len(imgs) - 1):
         print(f"[INFO] find_overlap start: {i} -> {i+1}")
-        dx, dy, conf = find_overlap(imgs[i], imgs[i + 1])
-        print(f"[INFO] find_overlap done : {i} -> {i+1}")
-        # print(f"[OVERLAP] {i}->{i+1} dx={dx}, dy={dy}, conf={conf:.3f}")
+        dx, dy, conf = find_overlap(
+            imgs[i],
+            imgs[i + 1],
+            max_shift_ratio=max_shift_ratio,
+            tol=tol,
+            direction=direction,
+        )
         px, py = positions[-1]
         positions.append((px + dx, py + dy))
     return positions
@@ -261,6 +276,22 @@ def parse_args():
         default="stitched.png",
         help="출력 파일명 (기본: stitched.png)",
     )
+    parser.add_argument(
+        "--direction",
+        type=str,
+        default="vertical",
+        choices=["both", "vertical", "horizontal"],
+        help="겹침 방향 고정 (both/vertical/horizontal)",
+    )
+    parser.add_argument(
+        "--max-shift-ratio",
+        type=float,
+        default=1.0,
+        help="탐색 범위를 각 축의 min크기 * ratio 로 제한",
+    )
+    parser.add_argument(
+        "--tol", type=int, default=5, help="픽셀 차이 허용치(그레이스케일)"
+    )
     return parser.parse_args()
 
 
@@ -276,14 +307,19 @@ def main():
         input_dir = os.path.join(script_dir, "images")
 
     # 2. 이미지 불러오기
-    # 해당 경로에 있는 모든 이미지 파일 경로 리스트
-    image_files = load_images(input_dir)
-    # 이미지 데이터(numpy arr) 리스트
-    imgs = _read_cv_images(image_files)
+
+    image_files = load_images(
+        input_dir
+    )  # 해당 경로에 있는 모든 이미지 파일 경로 리스트
+    imgs = _read_cv_images(image_files)  # 이미지 데이터(numpy arr) 리스트
 
     # 3. 이미지 겹침 계산
-    positions = _accumulate_positions(imgs)
-
+    positions = _accumulate_positions(
+        imgs,
+        direction=args.direction,
+        max_shift_ratio=args.max_shift_ratio,
+        tol=args.tol,
+    )
     # 4. 이어 붙이기
     stitched = _stitch_all(imgs, positions)
 
