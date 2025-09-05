@@ -5,6 +5,19 @@ import sys
 from pathlib import Path
 import numpy as np
 import cv2
+import time
+
+
+def _print_progress(curr, total, prefix="", bar_len=30):
+    ratio = 0 if total <= 0 else min(max(curr / total, 0), 1)
+    filled = int(bar_len * ratio)
+    bar = "#" * filled + "-" * (bar_len - filled)
+    pct = int(ratio * 100)
+    sys.stdout.write(f"\r{prefix} [{bar}] {pct:3d}%")
+    sys.stdout.flush()
+    if curr >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def _natural_key(s: str):
@@ -45,6 +58,14 @@ def _read_cv_images(paths):
             sys.exit(1)
         imgs.append(img)
     return imgs
+
+
+def _prep_gray_masks(imgs):
+    """이미지들을 (gray, valid_mask)로 한 번만 변환해 캐시"""
+    out = []
+    for img in imgs:
+        out.append(_to_gray_and_mask(img))
+    return out
 
 
 def _to_gray_and_mask(img):
@@ -128,21 +149,22 @@ def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
     return conf, num_valid
 
 
-def find_overlap(
-    imgA,
-    imgB,
+def find_overlap_gray(
+    grayA,
+    validA,
+    grayB,
+    validB,
     max_shift_ratio=1,
     tol=5,
     direction="both",
     slack_frac=0.25,  # 흔들림 허용 비율 (기본 25%)
+    progress_cb=None,
 ):
     """
-    완전 브루트포스(거친탐색→정밀)로 (dx,dy,confidence) 찾기.
+    완전 브루트포스로 (dx,dy,confidence) 찾기.
     - imgA, imgB 크기 달라도 OK(배율만 동일 가정)
     direction이 'vertical'이면 dx에 ±slack, 'horizontal'이면 dy에 ±slack 허용.
     """
-    grayA, validA = _to_gray_and_mask(imgA)
-    grayB, validB = _to_gray_and_mask(imgB)
 
     H1, W1 = grayA.shape  # gray는 2차원
     H2, W2 = grayB.shape
@@ -153,7 +175,7 @@ def find_overlap(
     min_dy = int(-H2 * max_shift_ratio)
     max_dy = int(H1 * max_shift_ratio)
 
-    # ← 축 제한
+    # 축 제한
     if direction == "vertical":  # 가로 이동 제한
         # 가로 정렬 범위(포함 정렬) ± 슬랙
         nominal_min = min(0, W1 - W2)
@@ -171,11 +193,21 @@ def find_overlap(
 
     # 탐색
     best_conf = -1.0
-    best_dx = 0
-    best_dy = 0
+    best_dx = best_dy = 0
     best_valid = 0
 
-    for dy in range(min_dy, max_dy + 1):
+    total_rows = max_dy - min_dy + 1
+    last_report = -1
+
+    for ridx, dy in enumerate(range(min_dy, max_dy + 1)):
+
+        if progress_cb:
+            # 너무 잦은 호출 방지: 1% 단위로만 보고
+            pct = int((ridx + 1) * 100 / total_rows) if total_rows > 0 else 100
+            if pct != last_report:
+                progress_cb(pct)
+                last_report = pct
+
         for dx in range(min_dx, max_dx + 1):
             conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
             if (
@@ -225,25 +257,50 @@ def _paste_bgra(canvas, src, x, y):
 
 
 def _accumulate_positions(
-    imgs,
-    *,
-    direction,
-    max_shift_ratio,
-    tol,
+    imgs, *, direction, max_shift_ratio=1, tol, conf_min=0.05, slack_frac=0.25
 ):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
+    gm = _prep_gray_masks(imgs)
     positions = [(0, 0)]
-    for i in range(len(imgs) - 1):
-        print(f"[INFO] find_overlap start: {i} -> {i+1}")
-        dx, dy, conf = find_overlap(
-            imgs[i],
-            imgs[i + 1],
+    n = len(imgs) - 1
+    for i in range(n):
+        title = f"[INFO] ({i+1}/{n}) overlap {i} -> {i+1}"
+        print(title)
+
+        (grayA, validA) = gm[i]
+        (grayB, validB) = gm[i + 1]
+
+        # 진행률 바: 행(dy) 기준으로 1% 단위 업데이트
+        def _cb(pct):
+            _print_progress(pct, 100, prefix="   progress")
+
+        t0 = time.time()
+
+        dx, dy, conf = find_overlap_gray(
+            grayA,
+            validA,
+            grayB,
+            validB,
             max_shift_ratio=max_shift_ratio,
             tol=tol,
             direction=direction,
+            slack_frac=slack_frac,
+            progress_cb=_cb,
         )
+        dt = time.time() - t0
+
+        if conf < conf_min:
+            print(
+                f"[WARN] low confidence {conf:.3f} at pair {i}->{i+1}, time={dt:.2f}s"
+            )
+        else:
+            print(
+                f"[OK] dx={dx}, dy={dy}, conf={conf:.3f}, pair={i}->{i+1}, time={dt:.2f}s"
+            )
+
         px, py = positions[-1]
         positions.append((px + dx, py + dy))
+
     return positions
 
 
@@ -287,47 +344,62 @@ def parse_args():
         "--max-shift-ratio",
         type=float,
         default=1.0,
-        help="탐색 범위를 각 축의 min크기 * ratio 로 제한",
+        help="탐색 범위 비율(각 축별 A/B 크기에 비례). vertical/horizontal에서는 비제한 축에만 주로 영향.",
     )
     parser.add_argument(
         "--tol", type=int, default=5, help="픽셀 차이 허용치(그레이스케일)"
     )
+    parser.add_argument(
+        "--conf-min", type=float, default=0.05, help="페어 매칭 최소 신뢰도 경고 임계치"
+    )
+    parser.add_argument(
+        "--slack-frac", type=float, default=0.25, help="수직/수평 외축 흔들림 허용 비율"
+    )
+
     return parser.parse_args()
 
 
 def main():
-    args = parse_args()
+    try:
+        args = parse_args()
 
-    # 1. 입력 받기
-    if args.input:
-        input_dir = os.path.abspath(args.input)
-    else:
-        # stitch.py가 있는 위치 + images 폴더
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        input_dir = os.path.join(script_dir, "images")
+        # 1. 입력 받기
+        if args.input:
+            input_dir = os.path.abspath(args.input)
+        else:
+            # stitch.py가 있는 위치 + images 폴더
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            input_dir = os.path.join(script_dir, "images")
 
-    # 2. 이미지 불러오기
+        # 2. 이미지 불러오기
 
-    image_files = load_images(
-        input_dir
-    )  # 해당 경로에 있는 모든 이미지 파일 경로 리스트
-    imgs = _read_cv_images(image_files)  # 이미지 데이터(numpy arr) 리스트
+        image_files = load_images(
+            input_dir
+        )  # 해당 경로에 있는 모든 이미지 파일 경로 리스트
+        imgs = _read_cv_images(image_files)  # 이미지 데이터(numpy arr) 리스트
 
-    # 3. 이미지 겹침 계산
-    positions = _accumulate_positions(
-        imgs,
-        direction=args.direction,
-        max_shift_ratio=args.max_shift_ratio,
-        tol=args.tol,
-    )
-    # 4. 이어 붙이기
-    stitched = _stitch_all(imgs, positions)
+        # 3. 이미지 겹침 계산
+        positions = _accumulate_positions(
+            imgs,
+            direction=args.direction,
+            max_shift_ratio=args.max_shift_ratio,
+            tol=args.tol,
+            conf_min=args.conf_min,
+            slack_frac=args.slack_frac,
+        )
+        # 4. 이어 붙이기
+        stitched = _stitch_all(imgs, positions)
 
-    # 5. 이어붙인 이미지 베젤 제거
-    # 6. 출력 저장
-    out_path = os.path.abspath(args.output)
-    cv2.imwrite(out_path, stitched)
-    print(f"[OK] saved -> {out_path}  size={stitched.shape[1]}x{stitched.shape[0]}")
+        # 5. 이어붙인 이미지 베젤 제거
+        # 6. 출력 저장
+        out_path = os.path.abspath(args.output)
+        ok = cv2.imwrite(out_path, stitched)
+        if not ok:
+            print(f"[ERROR] 저장 실패: {out_path}")
+        print(f"[OK] saved -> {out_path}  size={stitched.shape[1]}x{stitched.shape[0]}")
+
+    except KeyboardInterrupt:
+        print("\n[INFO] 사용자 중단(Ctrl+C). 중간 진행 상태에서 종료합니다.")
 
     pass
 
