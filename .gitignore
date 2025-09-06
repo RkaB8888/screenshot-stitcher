@@ -9,5 +9,6 @@ __pycache__/
 .vscode/
 .idea/
 
-# Outputs
-outputs/
+# Local test images & stitched result
+/images/
+/stitched*.png
