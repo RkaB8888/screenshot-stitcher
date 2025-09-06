@@ -8,6 +8,13 @@ import cv2
 import time
 
 
+def _fmt_hms(sec: float) -> str:
+    msec = int((sec - int(sec)) * 1000)
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.{msec:03d}"
+
+
 def _print_progress(curr, total, prefix="", bar_len=30):
     ratio = 0 if total <= 0 else min(max(curr / total, 0), 1)
     filled = int(bar_len * ratio)
@@ -363,6 +370,9 @@ def main():
     try:
         args = parse_args()
 
+        # --- 전체 타이머 시작 ---
+        t0_all = time.perf_counter()
+
         # 1. 입력 받기
         if args.input:
             input_dir = os.path.abspath(args.input)
@@ -379,6 +389,7 @@ def main():
         imgs = _read_cv_images(image_files)  # 이미지 데이터(numpy arr) 리스트
 
         # 3. 이미지 겹침 계산
+        t0_match = time.perf_counter()
         positions = _accumulate_positions(
             imgs,
             direction=args.direction,
@@ -387,16 +398,23 @@ def main():
             conf_min=args.conf_min,
             slack_frac=args.slack_frac,
         )
+        t1_match = time.perf_counter()
+
         # 4. 이어 붙이기
         stitched = _stitch_all(imgs, positions)
 
-        # 5. 이어붙인 이미지 베젤 제거
+        # 5. (베젤 제거 자리)
         # 6. 출력 저장
         out_path = os.path.abspath(args.output)
         ok = cv2.imwrite(out_path, stitched)
         if not ok:
             print(f"[ERROR] 저장 실패: {out_path}")
         print(f"[OK] saved -> {out_path}  size={stitched.shape[1]}x{stitched.shape[0]}")
+
+        # --- 시간 출력 ---
+        total_sec = time.perf_counter() - t0_all
+        match_sec = t1_match - t0_match
+        print(f"[TIME] match={_fmt_hms(match_sec)}, total={_fmt_hms(total_sec)}")
 
     except KeyboardInterrupt:
         print("\n[INFO] 사용자 중단(Ctrl+C). 중간 진행 상태에서 종료합니다.")
