@@ -130,6 +130,32 @@ def _overlap_slices(H1, W1, H2, W2, dx, dy):
     return (slice(ay1, ay2), slice(ax1, ax2), slice(by1, by2), slice(bx1, bx2))
 
 
+def _overlap_area(H1, W1, H2, W2, dx, dy):
+    """서로 겹치는 면적 계산"""
+    ax1 = max(0, dx)
+    ay1 = max(0, dy)
+    ax2 = min(W1, dx + W2)
+    ay2 = min(H1, dy + H2)
+    ow = ax2 - ax1
+    oh = ay2 - ay1
+    if ow <= 0 or oh <= 0:
+        return 0
+    return ow * oh
+
+
+def _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy):
+    """겹치는 면적 내림차순 정렬"""
+    cand = []
+    for dy in range(min_dy, max_dy + 1):
+        for dx in range(min_dx, max_dx + 1):
+            area = _overlap_area(H1, W1, H2, W2, dx, dy)
+            if area > 0:
+                cand.append((dx, dy, area))
+    # 면적 내림차순, 면적 같으면 중심(L1)이 가까운 순
+    cand.sort(key=lambda t: (-t[2], abs(t[0]) + abs(t[1])))
+    return cand
+
+
 def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
     """
     (dx,dy)에서의 일치도(confidence) 계산.
@@ -166,6 +192,8 @@ def find_overlap_gray(
     direction="both",
     slack_frac=0.25,  # 흔들림 허용 비율 (기본 25%)
     progress_cb=None,
+    early_stop=True,
+    min_valid_frac=0.75,
 ):
     """
     완전 브루트포스로 (dx,dy,confidence) 찾기.
@@ -198,35 +226,43 @@ def find_overlap_gray(
         min_dy = nominal_min - slack
         max_dy = nominal_max + slack
 
+    # 후보를 겹침 면적 내림차순으로 준비
+    candidates = _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy)
+    if not candidates:
+        return 0, 0, 0.0
+
+    total = len(candidates)
+    last_report = -1
+
     # 탐색
     best_conf = -1.0
     best_dx = best_dy = 0
     best_valid = 0
 
-    total_rows = max_dy - min_dy + 1
-    last_report = -1
-
-    for ridx, dy in enumerate(range(min_dy, max_dy + 1)):
+    for i, (dx, dy, area) in enumerate(candidates):
 
         if progress_cb:
             # 너무 잦은 호출 방지: 1% 단위로만 보고
-            pct = int((ridx + 1) * 100 / total_rows) if total_rows > 0 else 100
+            pct = int((i + 1) * 100 / total) if total > 0 else 100
             if pct != last_report:
                 progress_cb(pct)
                 last_report = pct
 
-        for dx in range(min_dx, max_dx + 1):
-            conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
-            if (
-                conf > best_conf
-                or (conf == best_conf and num_valid > best_valid)
-                or (
-                    conf == best_conf
-                    and num_valid == best_valid
-                    and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
-                )
-            ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
-                best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
+        conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
+        if (
+            conf > best_conf
+            or (conf == best_conf and num_valid > best_valid)
+            or (
+                conf == best_conf
+                and num_valid == best_valid
+                and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
+            )
+        ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
+            best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
+
+        # 조기 종료: conf==1 이면서 '충분히 큰' 겹침
+        if early_stop and conf == 1.0 and num_valid >= int(min_valid_frac * area):
+            return int(dx), int(dy), float(conf)
 
     return int(best_dx), int(best_dy), float(best_conf)
 
@@ -264,7 +300,15 @@ def _paste_bgra(canvas, src, x, y):
 
 
 def _accumulate_positions(
-    imgs, *, direction, max_shift_ratio=1, tol, conf_min=0.05, slack_frac=0.25
+    imgs,
+    *,
+    direction,
+    max_shift_ratio=1,
+    tol,
+    conf_min=0.05,
+    slack_frac=0.25,
+    early_stop,
+    min_valid_frac,
 ):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     gm = _prep_gray_masks(imgs)
@@ -293,6 +337,8 @@ def _accumulate_positions(
             direction=direction,
             slack_frac=slack_frac,
             progress_cb=_cb,
+            early_stop=early_stop,
+            min_valid_frac=min_valid_frac,
         )
         dt = time.time() - t0
 
@@ -362,6 +408,26 @@ def parse_args():
     parser.add_argument(
         "--slack-frac", type=float, default=0.25, help="수직/수평 외축 흔들림 허용 비율"
     )
+    parser.add_argument(
+        "--no-early-stop",
+        dest="early_stop",
+        action="store_false",
+        help="완전일치(conf=1) 조기 종료 끔",
+    )
+    parser.add_argument(
+        "--early-stop",
+        dest="early_stop",
+        action="store_true",
+        help="완전일치(conf=1) 조기 종료 켬(기본)",
+    )
+    parser.set_defaults(early_stop=True)
+
+    parser.add_argument(
+        "--min-valid-frac",
+        type=float,
+        default=0.75,
+        help="조기 종료 시 요구되는 겹침 면적 비율(0~1)",
+    )
 
     return parser.parse_args()
 
@@ -397,6 +463,8 @@ def main():
             tol=args.tol,
             conf_min=args.conf_min,
             slack_frac=args.slack_frac,
+            early_stop=args.early_stop,
+            min_valid_frac=args.min_valid_frac,
         )
         t1_match = time.perf_counter()
 
