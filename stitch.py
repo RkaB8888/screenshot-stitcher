@@ -313,6 +313,7 @@ def _accumulate_positions(
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     gm = _prep_gray_masks(imgs)
     positions = [(0, 0)]
+    pair_confs = []
     n = len(imgs) - 1
     for i in range(n):
         title = f"[INFO] ({i+1}/{n}) overlap {i} -> {i+1}"
@@ -321,7 +322,7 @@ def _accumulate_positions(
         (grayA, validA) = gm[i]
         (grayB, validB) = gm[i + 1]
 
-        # 진행률 바: 행(dy) 기준으로 1% 단위 업데이트
+        # 진행률 바
         def _cb(pct):
             _print_progress(pct, 100, prefix="   progress")
 
@@ -350,11 +351,11 @@ def _accumulate_positions(
             print(
                 f"[OK] dx={dx}, dy={dy}, conf={conf:.3f}, pair={i}->{i+1}, time={dt:.2f}s"
             )
-
+        pair_confs.append(conf)
         px, py = positions[-1]
         positions.append((px + dx, py + dy))
 
-    return positions
+    return positions, gm, pair_confs
 
 
 def _stitch_all(imgs, positions):
@@ -374,6 +375,88 @@ def _stitch_all(imgs, positions):
     canvas = np.zeros((H, W, 4), dtype=np.uint8)
     for img, (x, y) in zip(imgs, positions):
         _paste_bgra(canvas, _ensure_bgra(img), x + shift_x, y + shift_y)
+    return canvas
+
+
+def _stitch_all_distance(imgs, positions):
+    # 전역 바운딩
+    xs, ys = [], []
+    for img, (x, y) in zip(imgs, positions):
+        h, w = img.shape[:2]
+        xs += [x, x + w]
+        ys += [y, y + h]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    W = max_x - min_x
+    H = max_y - min_y
+    shift_x, shift_y = -min_x, -min_y
+
+    canvas = np.zeros((H, W, 4), dtype=np.uint8)
+    owner = np.full((H, W), -1, dtype=np.int32)
+
+    # 전역 중심 좌표
+    centers = []
+    for img, (x, y) in zip(imgs, positions):
+        h, w = img.shape[:2]
+        cx = (x + w / 2) + shift_x
+        cy = (y + h / 2) + shift_y
+        centers.append((cx, cy))
+
+    for idx, (img, (x, y)) in enumerate(zip(imgs, positions)):
+        src = _ensure_bgra(img)
+        h, w = src.shape[:2]
+        gx, gy = x + shift_x, y + shift_y  # 전역 좌표
+
+        # 캔버스 클리핑
+        x1, y1 = max(0, gx), max(0, gy)
+        x2, y2 = min(W, gx + w), min(H, gy + h)
+        if x1 >= x2 or y1 >= y2:
+            continue
+
+        # 새로 칠할 영역
+        subW, subH = (x2 - x1), (y2 - y1)
+        c_sub = canvas[y1:y2, x1:x2, :4]
+        o_sub = owner[y1:y2, x1:x2]
+        s_sub = src[y1 - gy : y1 - gy + subH, x1 - gx : x1 - gx + subW, :4]
+
+        # 유효(알파>0) 마스크
+        valid_sub = s_sub[:, :, 3] > 0
+        empty_mask_pre = (o_sub == -1) & valid_sub  # 완전 빈 곳
+        overlap_mask_pre = (o_sub != -1) & valid_sub  # 기존 오너가 있던 곳과 겹침
+
+        # 겹치는 기존 오너 id 집합
+        uniq = np.unique(o_sub[overlap_mask_pre])
+        # 방어적 제외(실제로는 필요 없지만 안전)
+        uniq = uniq[uniq != idx]
+
+        # 빈 곳은 바로 채움
+        if empty_mask_pre.any():
+            c_sub[empty_mask_pre] = s_sub[empty_mask_pre]
+            o_sub[empty_mask_pre] = idx
+
+        # 겹침은 거리 기반 선택
+        if uniq.size:
+
+            # 전역 좌표 그리드 (오너 중심 거리 계산용)
+            yy, xx = np.mgrid[y1:y2, x1:x2]
+            xx = xx.astype(np.float32)
+            yy = yy.astype(np.float32)
+
+            cx_i, cy_i = centers[idx]  # 미리 계산해 둔 각 이미지 중심 (전역 좌표)
+            d_cur = (xx - cx_i) ** 2 + (yy - cy_i) ** 2  # 현재(src)까지의 거리^2
+
+            for k in uniq:
+                # 아직 k가 소유하고 있고 이번 src도 덮는 픽셀만 대상으로
+                mk = (o_sub == k) & overlap_mask_pre
+                if not mk.any():
+                    continue
+                cx_k, cy_k = centers[k]
+                d_k = (xx - cx_k) ** 2 + (yy - cy_k) ** 2
+                repl = mk & (d_cur < d_k)
+                if repl.any():
+                    c_sub[repl] = s_sub[repl]
+                    o_sub[repl] = idx
+
     return canvas
 
 
@@ -456,7 +539,7 @@ def main():
 
         # 3. 이미지 겹침 계산
         t0_match = time.perf_counter()
-        positions = _accumulate_positions(
+        positions, gm, pair_confs = _accumulate_positions(
             imgs,
             direction=args.direction,
             max_shift_ratio=args.max_shift_ratio,
@@ -468,11 +551,16 @@ def main():
         )
         t1_match = time.perf_counter()
 
-        # 4. 이어 붙이기
-        stitched = _stitch_all(imgs, positions)
+        if all(c == 1.0 for c in pair_confs):  # 4-1. 덮어쓰며 이어 붙이기
+            print("[INFO] all pairs perfectly matched (conf=1.0). using fast paste.")
+            stitched = _stitch_all(imgs, positions)
+        else:  # 4-2. 베젤 제거하며 이어 붙이기
+            print(
+                "[INFO] imperfect matches detected. using distance-based anti-bezel stitch."
+            )
+            stitched = _stitch_all_distance(imgs, positions)
 
-        # 5. (베젤 제거 자리)
-        # 6. 출력 저장
+        # 5. 출력 저장
         out_path = os.path.abspath(args.output)
         ok = cv2.imwrite(out_path, stitched)
         if not ok:
