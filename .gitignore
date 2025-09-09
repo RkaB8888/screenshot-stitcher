@@ -10,5 +10,7 @@ __pycache__/
 .idea/
 
 # Local test images & stitched result
+*.png
 /images/
+!/images/.gitkeep
 /stitched*.png
