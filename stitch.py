@@ -249,12 +249,10 @@ def find_overlap_gray(
                 last_report = pct
 
         conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
-        if (
-            conf > best_conf
-            or (conf == best_conf and num_valid > best_valid)
+        if conf > 0.8 and (
+            (num_valid > best_valid)
             or (
-                conf == best_conf
-                and num_valid == best_valid
+                num_valid == best_valid
                 and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
             )
         ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
@@ -434,28 +432,38 @@ def _stitch_all_distance(imgs, positions):
             c_sub[empty_mask_pre] = s_sub[empty_mask_pre]
             o_sub[empty_mask_pre] = idx
 
-        # 겹침은 거리 기반 선택
-        if uniq.size:
+        if overlap_mask_pre.any():
+            # 1) 값이 동일한 픽셀은 무조건 최신 owner 로 갱신 (색은 그대로)
+            #    BGRA 전체 채널 동일 기준; RGB만 보려면 :3 로 바꿔도 됨.
+            same_pix = overlap_mask_pre & (s_sub[:, :, :3] == c_sub[:, :, :3]).all(
+                axis=2
+            )
+            if same_pix.any():
+                o_sub[same_pix] = idx
 
-            # 전역 좌표 그리드 (오너 중심 거리 계산용)
-            yy, xx = np.mgrid[y1:y2, x1:x2]
-            xx = xx.astype(np.float32)
-            yy = yy.astype(np.float32)
+            # 2) 나머지(값이 다른) 픽셀만 거리 비교
+            remain = overlap_mask_pre & ~same_pix
+            if remain.any():
+                # 이 픽셀들에 대해 현재 존재하는 owner 후보들
+                uniq = np.unique(o_sub[remain])
+                # 전역 좌표 그리드 (이제 꼭 필요할 때만 계산)
+                yy, xx = np.mgrid[y1:y2, x1:x2]
+                xx = xx.astype(np.float32)
+                yy = yy.astype(np.float32)
 
-            cx_i, cy_i = centers[idx]  # 미리 계산해 둔 각 이미지 중심 (전역 좌표)
-            d_cur = (xx - cx_i) ** 2 + (yy - cy_i) ** 2  # 현재(src)까지의 거리^2
+                cx_i, cy_i = centers[idx]
+                d_cur = (xx - cx_i) ** 2 + (yy - cy_i) ** 2
 
-            for k in uniq:
-                # 아직 k가 소유하고 있고 이번 src도 덮는 픽셀만 대상으로
-                mk = (o_sub == k) & overlap_mask_pre
-                if not mk.any():
-                    continue
-                cx_k, cy_k = centers[k]
-                d_k = (xx - cx_k) ** 2 + (yy - cy_k) ** 2
-                repl = mk & (d_cur < d_k)
-                if repl.any():
-                    c_sub[repl] = s_sub[repl]
-                    o_sub[repl] = idx
+                for k in uniq:
+                    mk = (o_sub == k) & remain
+                    if not mk.any():
+                        continue
+                    cx_k, cy_k = centers[k]
+                    d_k = (xx - cx_k) ** 2 + (yy - cy_k) ** 2
+                    repl = mk & (d_cur < d_k)
+                    if repl.any():
+                        c_sub[repl] = s_sub[repl]
+                        o_sub[repl] = idx
 
     return canvas
 
@@ -472,7 +480,7 @@ def parse_args():
     parser.add_argument(
         "--direction",
         type=str,
-        default="vertical",
+        default="horizontal",
         choices=["both", "vertical", "horizontal"],
         help="겹침 방향 고정 (both/vertical/horizontal)",
     )
@@ -503,7 +511,7 @@ def parse_args():
         action="store_true",
         help="완전일치(conf=1) 조기 종료 켬(기본)",
     )
-    parser.set_defaults(early_stop=True)
+    parser.set_defaults(early_stop=False)
 
     parser.add_argument(
         "--min-valid-frac",
