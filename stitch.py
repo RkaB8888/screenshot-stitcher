@@ -583,8 +583,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] 사용자 중단(Ctrl+C). 중간 진행 상태에서 종료합니다.")
 
-    pass
-
 
 if __name__ == "__main__":
     main()
