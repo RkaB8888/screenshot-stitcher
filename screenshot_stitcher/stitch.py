@@ -35,6 +35,20 @@ def _paste_bgra(canvas, src, x, y):
     canvas[y1:y2, x1:x2, 3] = 255  # 알파채널은 255로 통일
 
 
+def _dtb_map(h, w):
+    """자기 이미지 경계까지의 최소 거리 맵"""
+    y = np.arange(h, dtype=np.float32)[:, None]  # (h,1)
+    x = np.arange(w, dtype=np.float32)[None, :]  # (1,w)
+    # 유효 내부 경계: [l, w-1-r], [t, h-1-b]
+    left = x
+    right = (w - 1) - x
+    top = y
+    bottom = (h - 1) - y
+    dtb = np.minimum(np.minimum(left, right), np.minimum(top, bottom))
+    # 베젤 바깥/경계는 음수가 될 수 있으므로 0으로 클램프
+    return np.maximum(dtb, 0.0)  # (h,w) float32
+
+
 def _stitch_all(imgs, positions):
     """절대좌표에 맞춰 모두 붙여 하나의 BGRA 반환"""
     xs, ys = [], []
@@ -51,7 +65,15 @@ def _stitch_all(imgs, positions):
 
     canvas = np.zeros((H, W, 4), dtype=np.uint8)
     for img, (x, y) in zip(imgs, positions):
-        _paste_bgra(canvas, _ensure_bgra(img), x + shift_x, y + shift_y)
+        src = _ensure_bgra(img)
+        gx, gy = x + shift_x, y + shift_y
+        # 클리핑
+        x1, y1 = max(0, gx), max(0, gy)
+        x2, y2 = min(W, gx + src.shape[1]), min(H, gy + src.shape[0])
+        if x1 < x2 and y1 < y2:
+            sx1, sy1 = x1 - gx, y1 - gy
+            sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
+            canvas[y1:y2, x1:x2] = src[sy1:sy2, sx1:sx2]
     return canvas
 
 
@@ -69,79 +91,43 @@ def _stitch_all_distance(imgs, positions):
     shift_x, shift_y = -min_x, -min_y
 
     canvas = np.zeros((H, W, 4), dtype=np.uint8)
-    owner = np.full((H, W), -1, dtype=np.int32)
+    canvas_dtb = np.full((H, W), -1e9, dtype=np.float32)  # 아주 작은 값으로 초기화
 
-    # 전역 중심 좌표
-    centers = []
+    # 3) 각 이미지를 순회하며 배치
     for img, (x, y) in zip(imgs, positions):
-        h, w = img.shape[:2]
-        cx = (x + w / 2) + shift_x
-        cy = (y + h / 2) + shift_y
-        centers.append((cx, cy))
-
-    for idx, (img, (x, y)) in enumerate(zip(imgs, positions)):
         src = _ensure_bgra(img)
         h, w = src.shape[:2]
-        gx, gy = x + shift_x, y + shift_y  # 전역 좌표
 
-        # 캔버스 클리핑
+        # 이 이미지의 DTB 사전계산
+        dtb = _dtb_map(h, w)
+
+        gx, gy = x + shift_x, y + shift_y
         x1, y1 = max(0, gx), max(0, gy)
         x2, y2 = min(W, gx + w), min(H, gy + h)
         if x1 >= x2 or y1 >= y2:
             continue
 
-        # 새로 칠할 영역
-        subW, subH = (x2 - x1), (y2 - y1)
-        c_sub = canvas[y1:y2, x1:x2, :4]
-        o_sub = owner[y1:y2, x1:x2]
-        s_sub = src[y1 - gy : y1 - gy + subH, x1 - gx : x1 - gx + subW, :4]
+        sx1, sy1 = x1 - gx, y1 - gy
+        sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
 
-        # 유효(알파>0) 마스크
-        valid_sub = s_sub[:, :, 3] > 0
-        empty_mask_pre = (o_sub == -1) & valid_sub  # 완전 빈 곳
-        overlap_mask_pre = (o_sub != -1) & valid_sub  # 기존 오너가 있던 곳과 겹침
+        c_sub = canvas[y1:y2, x1:x2]  # (Hov, Wov, 4)
+        d_sub = canvas_dtb[y1:y2, x1:x2]  # (Hov, Wov)
+        s_sub = src[sy1:sy2, sx1:sx2]  # (Hov, Wov, 4)
+        t_sub = dtb[sy1:sy2, sx1:sx2]  # (Hov, Wov)
 
-        # 겹치는 기존 오너 id 집합
-        uniq = np.unique(o_sub[overlap_mask_pre])
-        # 방어적 제외(실제로는 필요 없지만 안전)
-        uniq = uniq[uniq != idx]
+        valid = s_sub[:, :, 3] > 0
 
-        # 빈 곳은 바로 채움
-        if empty_mask_pre.any():
-            c_sub[empty_mask_pre] = s_sub[empty_mask_pre]
-            o_sub[empty_mask_pre] = idx
+        # 승자 규칙: 자기 경계에서 더 먼 픽셀이 승리
+        take = valid & (t_sub >= d_sub)
 
-        if overlap_mask_pre.any():
-            # 1) 값이 동일한 픽셀은 무조건 최신 owner 로 갱신 (색은 그대로)
-            #    BGRA 전체 채널 동일 기준; RGB만 보려면 :3 로 바꿔도 됨.
-            same_pix = overlap_mask_pre & (s_sub[:, :, :3] == c_sub[:, :, :3]).all(
-                axis=2
-            )
-            if same_pix.any():
-                o_sub[same_pix] = idx
+        # 동일 색상일 때는 바꿔도/안 바꿔도 결과 동일하니 단순화 가능
+        # (원하면 take &= ~same_color 로 덮어쓰기 최소화 가능)
+        # same_color = (c_sub[:, :, :3] == s_sub[:, :, :3]).all(axis=2)
+        # take = take & ~same_color
 
-            # 2) 나머지(값이 다른) 픽셀만 거리 비교
-            remain = overlap_mask_pre & ~same_pix
-            if remain.any():
-                # 이 픽셀들에 대해 현재 존재하는 owner 후보들
-                uniq = np.unique(o_sub[remain])
-                # 전역 좌표 그리드 (이제 꼭 필요할 때만 계산)
-                yy, xx = np.mgrid[y1:y2, x1:x2]
-                xx = xx.astype(np.float32)
-                yy = yy.astype(np.float32)
-
-                cx_i, cy_i = centers[idx]
-                d_cur = (xx - cx_i) ** 2 + (yy - cy_i) ** 2
-
-                for k in uniq:
-                    mk = (o_sub == k) & remain
-                    if not mk.any():
-                        continue
-                    cx_k, cy_k = centers[k]
-                    d_k = (xx - cx_k) ** 2 + (yy - cy_k) ** 2
-                    repl = mk & (d_cur < d_k)
-                    if repl.any():
-                        c_sub[repl] = s_sub[repl]
-                        o_sub[repl] = idx
+        # 갱신
+        if take.any():
+            c_sub[take] = s_sub[take]
+            d_sub[take] = t_sub[take]
 
     return canvas

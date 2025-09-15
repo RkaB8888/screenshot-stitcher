@@ -29,33 +29,27 @@ def parse_args():
         help="탐색 범위 비율(각 축별 A/B 크기에 비례). vertical/horizontal에서는 비제한 축에만 주로 영향.",
     )
     parser.add_argument(
-        "--tol", type=int, default=5, help="픽셀 차이 허용치(그레이스케일)"
+        "--tol", type=int, default=0, help="픽셀 차이 허용치(그레이스케일)"
     )
     parser.add_argument(
-        "--conf-min", type=float, default=0.05, help="페어 매칭 최소 신뢰도 경고 임계치"
+        "--conf-min", type=float, default=0.80, help="페어 매칭 최소 신뢰도 경고 임계치"
     )
     parser.add_argument(
         "--slack-frac", type=float, default=0.25, help="수직/수평 외축 흔들림 허용 비율"
     )
-    parser.add_argument(
-        "--no-early-stop",
-        dest="early_stop",
-        action="store_false",
-        help="완전일치(conf=1) 조기 종료 끔",
-    )
-    parser.add_argument(
-        "--early-stop",
-        dest="early_stop",
-        action="store_true",
-        help="완전일치(conf=1) 조기 종료 켬(기본)",
-    )
-    parser.set_defaults(early_stop=False)
 
     parser.add_argument(
-        "--min-valid-frac",
-        type=float,
-        default=0.75,
-        help="조기 종료 시 요구되는 겹침 면적 비율(0~1)",
+        "--sample-step",
+        type=int,
+        default=4,
+        help="스코어 계산 시 사용할 그리드 샘플 간격(1이면 전체 픽셀 평가)",
+    )
+
+    parser.add_argument(
+        "--bezel",
+        type=str,
+        default="0,0,0,0",  # left,top,right,bottom (px)
+        help="베젤(무시) 크기: left,top,right,bottom 픽셀 단위. 예) 8,120,8,0",
     )
 
     return parser.parse_args()
@@ -80,24 +74,30 @@ def main():
         imgs = _read_cv_images(image_files)
 
         t0_match = time.perf_counter()
-        positions, gm, pair_confs = _accumulate_positions(
+        bz_left, bz_top, bz_right, bz_bottom = map(int, args.bezel.split(","))
+        positions, gm, pair_confs, pair_scores, pair_norms = _accumulate_positions(
             imgs,
             direction=args.direction,
             max_shift_ratio=args.max_shift_ratio,
             tol=args.tol,
             conf_min=args.conf_min,
             slack_frac=args.slack_frac,
-            early_stop=args.early_stop,
-            min_valid_frac=args.min_valid_frac,
+            sample_step=args.sample_step,
+            bezel=(bz_left, bz_top, bz_right, bz_bottom),
         )
         t1_match = time.perf_counter()
 
-        if all(c == 1.0 for c in pair_confs):  # 덮어쓰며 이어 붙이기
-            print("[INFO] 완전히 겹침")
-            stitched = _stitch_all(imgs, positions)
-        else:  # 베젤 제거하며 이어 붙이기
-            print("[INFO] 베젤을 고려한 스티칭 시작")
+        # --- 스티칭 ---
+        has_bezel = any(v > 0 for v in (bz_left, bz_top, bz_right, bz_bottom))
+
+        if has_bezel:
+            # 베젤이 있으면 반드시 거리 기반으로 처리
+            print("[INFO] _stitch_all_distance")
             stitched = _stitch_all_distance(imgs, positions)
+        else:
+            # 베젤이 없으면 단순 덮어쓰기
+            print("[INFO] _stitch_all")
+            stitched = _stitch_all(imgs, positions)
 
         out_path = os.path.abspath(args.output)
 

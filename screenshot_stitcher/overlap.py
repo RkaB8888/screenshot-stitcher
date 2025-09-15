@@ -3,6 +3,21 @@ import numpy as np
 import cv2
 
 
+def _inner_mask(H, W, left, top, right, bottom):
+    """
+    베젤을 제외한 내부만 True인 마스크 반환.
+    베젤 합이 크거나 영역이 비정상이면 빈 마스크 처리.
+    """
+    m = np.zeros((H, W), dtype=bool)
+    x1 = max(0, left)
+    y1 = max(0, top)
+    x2 = max(x1, W - max(0, right))
+    y2 = max(y1, H - max(0, bottom))
+    if x1 < x2 and y1 < y2:
+        m[y1:y2, x1:x2] = True
+    return m
+
+
 def _overlap_slices(H1, W1, H2, W2, dx, dy):
     """
     B를 A 위에 (dx, dy)만큼 이동했을 때 A/B의 겹침 슬라이스 계산.
@@ -13,7 +28,6 @@ def _overlap_slices(H1, W1, H2, W2, dx, dy):
     ay1 = max(0, dy)  # 좌상단 꼭짓점
     ax2 = min(W1, dx + W2)  # 우하단 꼭짓점
     ay2 = min(H1, dy + H2)  # 우하단 꼭짓점
-
     if ax1 >= ax2 or ay1 >= ay2:
         return None
 
@@ -53,30 +67,64 @@ def _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy):
     return cand
 
 
-def _score_at(grayA, validA, grayB, validB, dx, dy, tol):
+def _score_at(
+    grayA,
+    validA,
+    grayB,
+    validB,
+    dx,
+    dy,
+    tol,
+    sample_step=4,
+    eps=1e-6,
+    bezA=None,
+    bezB=None,
+):
     """
-    (dx,dy)에서의 일치도(confidence) 계산.
-    confidence = (abs(A-B)<=tol & 유효마스크)/유효겹침픽셀
+    (dx,dy)에서의 단순 일치도 계산.
+    - 픽셀 절대차가 tol 이하면 1점, 아니면 0점
+    - score = 일치하는 유효 샘플 수
+    - norm  = 유효 샘플 수 (이론 최대)
+    - conf  = score / norm  (0~1)
     """
     H1, W1 = grayA.shape
     H2, W2 = grayB.shape
     sl = _overlap_slices(H1, W1, H2, W2, dx, dy)  # 슬라이스 인덱스 4개 반환
     if sl is None:
-        return 0.0, 0
+        return 0.0, 0, 0.0, 0.0
 
     ay, ax, by, bx = sl
-    a = grayA[ay, ax]
-    b = grayB[by, bx]
-    v = validA[ay, ax] & validB[by, bx]  # 투명한지 체크
-    if not v.any():
-        return 0.0, 0
 
-    diff = cv2.absdiff(a, b)  # 절댓값 계산
-    match = (diff <= tol) & v  # 차이가 기준 이내이며 유효 픽셀인지
+    # 그리드 서브샘플링 슬라이스 구성
+    sAy = slice(ay.start, ay.stop, sample_step)
+    sAx = slice(ax.start, ax.stop, sample_step)
+    sBy = slice(by.start, by.stop, sample_step)
+    sBx = slice(bx.start, bx.stop, sample_step)
+
+    # 원래 전체 겹침 → 샘플 겹침으로 다운샘플
+    a = grayA[sAy, sAx]
+    b = grayB[sBy, sBx]
+    v = validA[sAy, sAx] & validB[sBy, sBx]  # 투명한지 체크
+
+    # 베젤 제외: 내부마스크가 주어졌다면 샘플 슬라이스로 잘라서 v에 AND
+    if bezA is not None:
+        v &= bezA[sAy, sAx]
+    if bezB is not None:
+        v &= bezB[sBy, sBx]
+
+    if not v.any():
+        return 0.0, 0, 0.0, 0.0
+
+    # 픽셀 일치도
+    diff = cv2.absdiff(a, b)
+    match = (diff <= tol) & v
+
+    # 집계: 총점(score)과 정규화(conf)
+    score = float(match.sum())  # 면적 반영된 실제 점수(타이브레이커 강함)
+    norm = float(v.sum()) + eps  # 전체 유효 샘플 수
+    conf = score / norm  # 0~1 스케일의 신뢰도
     num_valid = int(v.sum())  # 비교한 유효 픽셀 갯수
-    num_match = int(match.sum())  # 유효 픽셀 중 기준에 적합한 갯수
-    conf = num_match / num_valid  # 비율 계산
-    return conf, num_valid
+    return conf, num_valid, score, norm
 
 
 def find_overlap_gray(
@@ -85,12 +133,12 @@ def find_overlap_gray(
     grayB,
     validB,
     max_shift_ratio=1,
-    tol=5,
+    tol=0,
     direction="both",
     slack_frac=0.25,  # 흔들림 허용 비율 (기본 25%)
     progress_cb=None,
-    early_stop=True,
-    min_valid_frac=0.75,
+    sample_step=4,
+    bezel=(0, 0, 0, 0),
 ):
     """
     완전 브루트포스로 (dx,dy,confidence) 찾기.
@@ -100,6 +148,11 @@ def find_overlap_gray(
 
     H1, W1 = grayA.shape  # gray는 2차원
     H2, W2 = grayB.shape
+
+    # 베젤 → 내부마스크 (A, B는 같은 베젤이라고 가정한 경우)
+    bz_left, bz_top, bz_right, bz_bottom = bezel
+    bezA = _inner_mask(H1, W1, bz_left, bz_top, bz_right, bz_bottom)
+    bezB = _inner_mask(H2, W2, bz_left, bz_top, bz_right, bz_bottom)
 
     # 탐색 한계: 각각의 크기에 비례 -> 겹치는 영역의 최대
     min_dx = int(-W2 * max_shift_ratio)
@@ -126,15 +179,14 @@ def find_overlap_gray(
     # 후보를 겹침 면적 내림차순으로 준비
     candidates = _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy)
     if not candidates:
-        return 0, 0, 0.0
+        return 0, 0, 0.0, 0.0, 1.0, True
 
     total = len(candidates)
     last_report = -1
 
-    # 탐색
-    best_conf = -1.0
-    best_dx = best_dy = 0
-    best_valid = 0
+    # 탐색 (가중 중심 튜플 정렬 + 폴백)
+    best = None  # 임계/규칙 통과 기준으로 고른 최선
+    best_overall = None  # 임계 무시, 단순 스코어 최대 후보(폴백용)
 
     for i, (dx, dy, area) in enumerate(candidates):
 
@@ -145,18 +197,35 @@ def find_overlap_gray(
                 progress_cb(pct)
                 last_report = pct
 
-        conf, num_valid = _score_at(grayA, validA, grayB, validB, dx, dy, tol)
-        if conf > 0.9 and (
-            (num_valid > best_valid)
-            or (
-                num_valid == best_valid
-                and (abs(dx) + abs(dy) < abs(best_dx) + abs(best_dy))
-            )
-        ):  # 일치율 > 유효 픽셀 수 > 더 적은 이동
-            best_conf, best_valid, best_dx, best_dy = conf, num_valid, dx, dy
+        conf, num_valid, score, norm = _score_at(
+            grayA,
+            validA,
+            grayB,
+            validB,
+            dx,
+            dy,
+            tol,
+            sample_step=sample_step,
+            bezA=bezA,
+            bezB=bezB,
+        )
 
-        # 조기 종료: conf==1 이면서 '충분히 큰' 겹침
-        if early_stop and conf == 1.0 and num_valid >= int(min_valid_frac * area):
-            return int(dx), int(dy), float(conf)
+        key = (conf, score, num_valid, -(abs(dx) + abs(dy)))
 
-    return int(best_dx), int(best_dy), float(best_conf)
+        if best_overall is None or key > best_overall[0]:
+            best_overall = (key, dx, dy, conf, score, norm)
+
+        # 최선 갱신
+        if best is None or key > best[0]:
+            best = (key, dx, dy, conf, score, norm)
+
+    # 최종 반환 (best 없으면 overall 폴백)
+    if best is not None:
+        _, dx, dy, conf, score, norm = best
+        print("[INFO] return best")
+        return int(dx), int(dy), float(conf), float(score), float(norm), False
+    else:
+        # 폴백 경고는 상위에서 로그로 출력하는 편이 깔끔
+        _, dx, dy, conf, score, norm = best_overall
+        print("[INFO] return best overall")
+        return int(dx), int(dy), float(conf), float(score), float(norm), True

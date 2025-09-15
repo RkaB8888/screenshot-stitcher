@@ -13,13 +13,16 @@ def _accumulate_positions(
     tol,
     conf_min,
     slack_frac,
-    early_stop,
-    min_valid_frac,
+    sample_step=4,
+    bezel=(0, 0, 0, 0),
 ):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     gm = _prep_gray_masks(imgs)
+
     positions = [(0, 0)]
     pair_confs = []
+    pair_scores = []
+    pair_norms = []
     n = len(imgs) - 1
     for i in range(n):
         title = f"[INFO] ({i+1}/{n}) overlap {i} -> {i+1}"
@@ -34,7 +37,7 @@ def _accumulate_positions(
 
         t0 = time.time()
 
-        dx, dy, conf = find_overlap_gray(
+        dx, dy, conf, score, norm, fallback = find_overlap_gray(
             grayA,
             validA,
             grayB,
@@ -44,21 +47,26 @@ def _accumulate_positions(
             direction=direction,
             slack_frac=slack_frac,
             progress_cb=_cb,
-            early_stop=early_stop,
-            min_valid_frac=min_valid_frac,
+            sample_step=sample_step,
+            bezel=bezel,
         )
         dt = time.time() - t0
+        if fallback:
+            print("[WARN] fallback used")
 
-        if conf < conf_min:
+        fill = score / (norm + 1e-6)  # 0~1
+        if (conf < conf_min) or (score < 0.7 * norm):
             print(
-                f"[WARN] low confidence {conf:.3f} at pair {i}->{i+1}, time={dt:.2f}s"
+                f"[WARN] low match: score={score:.3f}, conf={conf:.3f}, fill={fill:.2%}, pair={i}->{i+1}, time={dt:.2f}s"
             )
         else:
             print(
-                f"[OK] dx={dx}, dy={dy}, conf={conf:.3f}, pair={i}->{i+1}, time={dt:.2f}s"
+                f"[OK] dx={dx}, dy={dy}, score={score:.3f}, conf={conf:.3f}, fill={fill:.2%}, pair={i}->{i+1}, time={dt:.2f}s"
             )
         pair_confs.append(conf)
+        pair_scores.append(score)
+        pair_norms.append(norm)
         px, py = positions[-1]
         positions.append((px + dx, py + dy))
 
-    return positions, gm, pair_confs
+    return positions, gm, pair_confs, pair_scores, pair_norms
