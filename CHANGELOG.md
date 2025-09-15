@@ -75,3 +75,43 @@
 - 코드 구조를 모듈 단위(`cli`, `io_utils`, `preprocess`, `overlap`, `pipeline`, `stitch`, `progress`)로 분리.
 - 엔트리포인트를 `main.py`로 단순화하고, 내부 로직은 각 모듈에서 관리하도록 리팩터링.
 - 기능 변경 없음, 기존 CLI 옵션 및 출력 결과는 동일.
+
+## 2025-09-15
+
+### Problem
+
+* 베젤 부분이 점수 계산에 포함되어 `conf=1.0`로 잘못 판정되면서, 실제 스티칭에서는 베젤끼리 덮어쓰는 현상 발생.
+* 기존 점수 계산식이 복잡하여 디버깅이 어려웠음.
+
+### Added
+
+* **`--bezel` CLI 옵션**: `left,top,right,bottom` 형식으로 베젤 영역을 지정. 지정된 베젤은 매칭 점수 계산 시 무시됨.
+* **`--sample-step` CLI 옵션**: 점수 계산 시 사용할 균등 그리드 서브샘플링 간격 지정 (기본 4).
+
+### Changed
+
+* 점수 계산 방식을 **이진 단순화**:
+
+  * |A–B| ≤ tol 이면 1점, 아니면 0점.
+  * conf = score / norm 구조로 단순화.
+* `_accumulate_positions` 반환값 확장:
+
+  * `(positions, gm, pair_confs, pair_scores, pair_norms)` 로 변경, 각 페어의 정합 품질(score/norm)도 추적 가능.
+* 스티칭 로직을 **베젤 유무로 분기**:
+
+  * `--bezel`이 모두 0이면 `_stitch_all` (단순 덮어쓰기).
+  * 하나라도 >0이면 `_stitch_all_distance` (거리 기반 승자 규칙).
+
+### Fixed
+
+* 베젤 영역이 conf 계산에 포함되지 않도록 내부 마스크(`_inner_mask`)를 추가하여, 베젤끼리의 잘못된 완전일치(conf=1.0) 방지.
+
+### Notes
+
+* `--tol` 기본값을 0으로 변경: 동일 캡처 전제. 필요 시 1\~3 정도로 조정 권장.
+* `--conf-min` 기본값을 0.80으로 강화해, 품질이 낮은 매칭에 대해 경고가 출력되도록 개선.
+
+### Removed
+
+* `--early-stop` / `--no-early-stop` CLI 옵션 제거.
+* `--min-valid-frac` CLI 옵션 제거 (로직 단순화 목적).

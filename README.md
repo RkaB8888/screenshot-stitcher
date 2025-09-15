@@ -10,6 +10,7 @@
 ## 현재 상태 (MVP)
 
 * 전제: 동일 배율(줌), 같은 원본 소스, 회전/반전/원근 왜곡 없음
+
 * 기능:
 
   * 입력 폴더 내 PNG 이미지 자동 로드 및 정렬
@@ -18,13 +19,14 @@
 
     * tol(허용 오차), conf-min(신뢰도 기준), slack-frac(허용 흔들림) 옵션 지원
     * direction 옵션 (both/vertical/horizontal) 지원
-    * **최적화:** 겹침 면적 내림차순 탐색 및 조기 종료 옵션(`--early-stop`, `--min-valid-frac`) 추가
+    * **최적화:** 겹침 면적 내림차순 탐색 및 샘플링(`--sample-step`) 지원
   * 진행률 표시 및 매칭 로그 출력
   * **스티칭 분기 로직**
 
-    * 모든 페어가 conf==1.0 → 빠른 덮어쓰기(`_stitch_all`)
-    * 하나라도 conf<1.0 → 거리 기반 안티-베젤 스티칭(`_stitch_all_distance`)
+    * 모든 베젤 값이 0이면 → 단순 덮어쓰기(`_stitch_all`)
+    * 하나라도 베젤 > 0이면 → 거리 기반 안티-베젤 스티칭(`_stitch_all_distance`)
   * 겹친 이미지를 이어붙여 PNG 저장 (`stitched.png`)
+
 * CLI 옵션:
 
   * `--input`: 입력 폴더 경로
@@ -34,8 +36,8 @@
   * `--tol`: 픽셀 차이 허용치
   * `--conf-min`: 신뢰도 임계값
   * `--slack-frac`: 흔들림 허용 비율
-  * `--early-stop` / `--no-early-stop`: 완전일치(conf=1) 시 조기 종료 옵션
-  * `--min-valid-frac`: 조기 종료 시 요구되는 겹침 면적 비율
+  * `--sample-step`: 매칭 시 샘플링 간격(기본 4, 1이면 전체 픽셀 평가)
+  * `--bezel`: 베젤 크기(left,top,right,bottom, 기본 `0,0,0,0`)
 
 ## 코드 구조
 
@@ -48,7 +50,7 @@ screenshot_stitcher/
  ├─ preprocess.py     # 그레이 변환 및 마스크 처리
  ├─ overlap.py        # 겹침 탐색 로직
  ├─ pipeline.py       # 이미지 정합 및 좌표 누적
- ├─ stitch.py         # 스티칭 및 owner 규칙
+ ├─ stitch.py         # 스티칭 및 DTB 기반 승자 규칙
  └─ progress.py       # 진행률/시간 표시
 ```
 
