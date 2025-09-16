@@ -32,8 +32,11 @@ def _accumulate_positions(
         (grayB, validB) = gm[i + 1]
 
         # 진행률 바
-        def _cb(pct):
-            _print_progress(pct, 100, prefix="   progress")
+        def _cb_match(pct):
+            _print_progress(pct, 100, prefix="   match    ")
+
+        def _cb_refine(pct):
+            _print_progress(pct, 100, prefix="   refine   ")
 
         t0 = time.time()
 
@@ -46,7 +49,8 @@ def _accumulate_positions(
             tol=tol,
             direction=direction,
             slack_frac=slack_frac,
-            progress_cb=_cb,
+            progress_cb=_cb_match,  # 후보 선별 진행률
+            progress_cb_refine=_cb_refine,  # 정밀 계산 진행률
             sample_step=sample_step,
             bezel=bezel,
         )

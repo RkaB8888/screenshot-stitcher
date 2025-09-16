@@ -54,6 +54,61 @@ def _overlap_area(H1, W1, H2, W2, dx, dy):
     return ow * oh
 
 
+def _center_roi_slices(ay, ax, by, bx, k=5):
+    """겹침 슬라이스(ay,ax,by,bx)에서 중앙 k×k(가능하면) 슬라이스 반환"""
+    oh = ay.stop - ay.start
+    ow = ax.stop - ax.start
+    if oh <= 0 or ow <= 0:
+        return None
+    r = max(1, k // 2)
+    # 겹침이 작으면 k 축소
+    hh = min(oh, 2 * r + 1)
+    ww = min(ow, 2 * r + 1)
+    cyA = ay.start + oh // 2
+    cxA = ax.start + ow // 2
+    cyB = by.start + oh // 2
+    cxB = bx.start + ow // 2
+    Ay = slice(max(ay.start, cyA - hh // 2), min(ay.stop, cyA + (hh - hh // 2)))
+    Ax = slice(max(ax.start, cxA - ww // 2), min(ax.stop, cxA + (ww - ww // 2)))
+    By = slice(max(by.start, cyB - hh // 2), min(by.stop, cyB + (hh - hh // 2)))
+    Bx = slice(max(bx.start, cxB - ww // 2), min(bx.stop, cxB + (ww - ww // 2)))
+    if (Ay.stop - Ay.start) <= 0 or (Ax.stop - Ax.start) <= 0:
+        return None
+    return Ay, Ax, By, Bx
+
+
+def _center_all_within_tol(
+    grayA, validA, grayB, validB, dx, dy, tol, bezA=None, bezB=None, k=5
+):
+    """
+    중앙 k×k에서 유효 픽셀 모두가 |A-B| <= tol 이어야 통과(True).
+    유효 픽셀 0개면 실패(False).
+    """
+    H1, W1 = grayA.shape
+    H2, W2 = grayB.shape
+    sl = _overlap_slices(H1, W1, H2, W2, dx, dy)
+    if sl is None:
+        return False
+    ay, ax, by, bx = sl
+    sub = _center_roi_slices(ay, ax, by, bx, k=k)
+    if sub is None:
+        return False
+    Ay, Ax, By, Bx = sub
+    a = grayA[Ay, Ax]
+    b = grayB[By, Bx]
+    v = validA[Ay, Ax] & validB[By, Bx]
+    if bezA is not None:
+        v &= bezA[Ay, Ax]
+    if bezB is not None:
+        v &= bezB[By, Bx]
+    nv = int(v.sum())
+    if nv == 0:
+        return False
+    diff = cv2.absdiff(a, b)
+    # 하나라도 tol 초과면 탈락 → 모두 tol 이하일 때만 통과
+    return bool(((diff <= tol) & v).sum() == nv)
+
+
 def _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy):
     """겹치는 면적 내림차순 정렬"""
     cand = []
@@ -136,7 +191,8 @@ def find_overlap_gray(
     tol=0,
     direction="both",
     slack_frac=0.25,  # 흔들림 허용 비율 (기본 25%)
-    progress_cb=None,
+    progress_cb=None,  # 매칭(후보 선별) 진행 콜백
+    progress_cb_refine=None,  # 정밀 계산 진행 콜백
     sample_step=4,
     bezel=(0, 0, 0, 0),
 ):
@@ -146,15 +202,15 @@ def find_overlap_gray(
     direction이 'vertical'이면 dx에 ±slack, 'horizontal'이면 dy에 ±slack 허용.
     """
 
-    H1, W1 = grayA.shape  # gray는 2차원
+    H1, W1 = grayA.shape
     H2, W2 = grayB.shape
 
-    # 베젤 → 내부마스크 (A, B는 같은 베젤이라고 가정한 경우)
+    # 베젤 → 내부마스크
     bz_left, bz_top, bz_right, bz_bottom = bezel
     bezA = _inner_mask(H1, W1, bz_left, bz_top, bz_right, bz_bottom)
     bezB = _inner_mask(H2, W2, bz_left, bz_top, bz_right, bz_bottom)
 
-    # 탐색 한계: 각각의 크기에 비례 -> 겹치는 영역의 최대
+    # 탐색 한계
     min_dx = int(-W2 * max_shift_ratio)
     max_dx = int(W1 * max_shift_ratio)
     min_dy = int(-H2 * max_shift_ratio)
@@ -178,16 +234,22 @@ def find_overlap_gray(
 
     # 후보를 겹침 면적 내림차순으로 준비
     candidates = _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy)
+
     if not candidates:
-        return 0, 0, 0.0, 0.0, 1.0, True
+        print("[WARN] NO CANDIDATE")
+        # direction 기준 안전 오프셋 반환
+        if direction == "horizontal":
+            return int(W1), 0, 0.0, 0.0, 1.0, True
+        else:
+            return 0, int(H1), 0.0, 0.0, 1.0, True
 
     total = len(candidates)
     last_report = -1
 
-    # 탐색 (가중 중심 튜플 정렬 + 폴백)
-    best = None  # 임계/규칙 통과 기준으로 고른 최선
-    best_overall = None  # 임계 무시, 단순 스코어 최대 후보(폴백용)
-
+    # 1) 중앙 k×k 미니체크
+    prelim = []
+    K_CENTER = 5  # 중앙 패치 크기(필요시 3/7로 조정 가능)
+    print(f"total: {total}")
     for i, (dx, dy, area) in enumerate(candidates):
 
         if progress_cb:
@@ -196,6 +258,34 @@ def find_overlap_gray(
             if pct != last_report:
                 progress_cb(pct)
                 last_report = pct
+
+        # 중앙 k×k에서 한 픽셀이라도 |A-B| > tol 이면 탈락
+        ok = _center_all_within_tol(
+            grayA, validA, grayB, validB, dx, dy, tol, bezA=bezA, bezB=bezB, k=K_CENTER
+        )
+        if ok:
+            prelim.append((dx, dy, area))
+
+    # 2) 미니체크 통과 후보 없음 → 겹침 없음
+    if not prelim:
+        print("[WARN] NO PRELIM MATCH")
+        # direction 기준 안전 오프셋
+        if direction == "horizontal":
+            return int(W1), 0, 0.0, 0.0, 1.0, True
+        else:  # 'vertical' 또는 'both'는 세로로 이어붙임
+            return 0, int(H1), 0.0, 0.0, 1.0, True
+
+    # 3) 정밀 계산
+    final_best = None
+    total_refine = len(prelim)
+    last_report2 = -1
+    print(f"total_refine: {total_refine}")
+    for j, (dx, dy, area) in enumerate(prelim):
+        if progress_cb_refine and total_refine > 0:
+            pct2 = int((j + 1) * 100 / total_refine)
+            if pct2 != last_report2:
+                progress_cb_refine(pct2)
+                last_report2 = pct2
 
         conf, num_valid, score, norm = _score_at(
             grayA,
@@ -209,23 +299,9 @@ def find_overlap_gray(
             bezA=bezA,
             bezB=bezB,
         )
+        key = (conf, score, num_valid, area, -(abs(dx) + abs(dy)))
+        if (final_best is None) or (key > final_best[0]):
+            final_best = (key, dx, dy, conf, score, norm)
 
-        key = (conf, score, num_valid, -(abs(dx) + abs(dy)))
-
-        if best_overall is None or key > best_overall[0]:
-            best_overall = (key, dx, dy, conf, score, norm)
-
-        # 최선 갱신
-        if best is None or key > best[0]:
-            best = (key, dx, dy, conf, score, norm)
-
-    # 최종 반환 (best 없으면 overall 폴백)
-    if best is not None:
-        _, dx, dy, conf, score, norm = best
-        print("[INFO] return best")
-        return int(dx), int(dy), float(conf), float(score), float(norm), False
-    else:
-        # 폴백 경고는 상위에서 로그로 출력하는 편이 깔끔
-        _, dx, dy, conf, score, norm = best_overall
-        print("[INFO] return best overall")
-        return int(dx), int(dy), float(conf), float(score), float(norm), True
+    _, dx, dy, conf, score, norm = final_best
+    return int(dx), int(dy), float(conf), float(score), float(norm), False

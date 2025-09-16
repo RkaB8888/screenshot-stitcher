@@ -41,14 +41,14 @@ def parse_args():
     parser.add_argument(
         "--sample-step",
         type=int,
-        default=4,
+        default=8,
         help="스코어 계산 시 사용할 그리드 샘플 간격(1이면 전체 픽셀 평가)",
     )
 
     parser.add_argument(
         "--bezel",
         type=str,
-        default="0,0,0,0",  # left,top,right,bottom (px)
+        default="20,20,20,20",  # left,top,right,bottom (px)
         help="베젤(무시) 크기: left,top,right,bottom 픽셀 단위. 예) 8,120,8,0",
     )
 
