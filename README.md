@@ -18,8 +18,9 @@
 
     * tol(허용 오차), conf-min(신뢰도 기준), slack-frac(허용 흔들림) 옵션 지원
     * direction 옵션 (both/vertical/horizontal) 지원
-    * **최적화:** 겹침 면적 내림차순 탐색 및 샘플링(`--sample-step`) 지원
-    * **추가 최적화:** 중앙 k×k(기본 5×5) 미니체크를 통한 후보 선별 → 불필요한 정밀 계산 최소화
+    * **최적화**: 겹침 면적 기반 후보 생성 및 샘플링(`--sample-step`)
+    * **라인 기반 프리체크:** 중앙 행/열 단일선 비교로 빠른 후보 선별
+    * **옵션형 정밀화:** 필요 시 중앙 k×k 미니패치(`--prelim-refine`)까지 확인
   * 진행률 표시: 매칭(match) 단계와 정밀(refine) 단계 분리
   * **스티칭 분기 로직**
 
@@ -36,8 +37,9 @@
   * `--tol`: 픽셀 차이 허용치
   * `--conf-min`: 신뢰도 임계값
   * `--slack-frac`: 흔들림 허용 비율
-  * `--sample-step`: 매칭 시 샘플링 간격(기본 8, 1이면 전체 픽셀 평가)
-  * `--bezel`: 베젤 크기(left,top,right,bottom, 기본 `20,20,20,20`)
+  * `--sample-step`: 매칭 시 샘플링 간격(기본 2, 1이면 전체 픽셀 평가)
+  * `--bezel`: 베젤 크기(left,top,right,bottom, 기본 `0,0,0,0`)
+  * `--prelim-refine`: 프리체크 시 중앙 k×k 미니패치까지 확인 (정밀/느림)
 
 ## 코드 구조
 
@@ -48,7 +50,7 @@ screenshot_stitcher/
  ├─ cli.py            # CLI 인자 파싱 및 실행 흐름
  ├─ io_utils.py       # 이미지 로드 관련 함수
  ├─ preprocess.py     # 그레이 변환 및 마스크 처리
- ├─ overlap.py        # 겹침 탐색 로직
+ ├─ overlap.py        # 겹침 탐색 및 프리체크 로직
  ├─ pipeline.py       # 이미지 정합 및 좌표 누적
  ├─ stitch.py         # 스티칭 및 DTB 기반 승자 규칙
  └─ progress.py       # 진행률/시간 표시
