@@ -77,38 +77,6 @@ def _center_roi_slices(ay, ax, by, bx, k=5):
     return Ay, Ax, By, Bx
 
 
-def _center_all_within_tol(
-    grayA, validA, grayB, validB, dx, dy, tol, bezA=None, bezB=None, k=5
-):
-    """
-    중앙 k×k에서 유효 픽셀 모두가 |A-B| <= tol 이어야 통과(True).
-    유효 픽셀 0개면 실패(False).
-    """
-    H1, W1 = grayA.shape
-    H2, W2 = grayB.shape
-    sl = _overlap_slices(H1, W1, H2, W2, dx, dy)
-    if sl is None:
-        return False
-    ay, ax, by, bx = sl
-    sub = _center_roi_slices(ay, ax, by, bx, k=k)
-    if sub is None:
-        return False
-    Ay, Ax, By, Bx = sub
-    a = grayA[Ay, Ax]
-    b = grayB[By, Bx]
-    v = validA[Ay, Ax] & validB[By, Bx]
-    if bezA is not None:
-        v &= bezA[Ay, Ax]
-    if bezB is not None:
-        v &= bezB[By, Bx]
-    nv = int(v.sum())
-    if nv == 0:
-        return False
-    diff = cv2.absdiff(a, b)
-    # 하나라도 tol 초과면 탈락 → 모두 tol 이하일 때만 통과
-    return bool(((diff <= tol) & v).sum() == nv)
-
-
 def _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy):
     """겹치는 면적 내림차순 정렬"""
     cand = []
@@ -118,7 +86,7 @@ def _ordered_candidates(H1, W1, H2, W2, min_dx, max_dx, min_dy, max_dy):
             if area > 0:
                 cand.append((dx, dy, area))
     # 면적 내림차순, 면적 같으면 중심(L1)이 가까운 순
-    cand.sort(key=lambda t: (-t[2], abs(t[0]) + abs(t[1])))
+    # cand.sort(key=lambda t: (-t[2], abs(t[0]) + abs(t[1])))
     return cand
 
 
@@ -182,6 +150,208 @@ def _score_at(
     return conf, num_valid, score, norm
 
 
+# =========================
+# 라인 기반 프리체크 + (옵션) 미니패치
+# =========================
+LINE_ATTEMPTS = 7  # 중앙선 포함 최대 시도 라인 수
+LINE_STEP = 5  # 중앙에서 떨어진 간격(px)
+MINI_K = 5  # 정밀 미니패치 크기(정수, 홀수 권장)
+
+
+def _line_precheck(
+    grayA,
+    validA,
+    grayB,
+    validB,
+    ay,
+    ax,
+    by,
+    bx,
+    tol,
+    bezA=None,
+    bezB=None,
+    *,
+    use_rows=False,  # True: 행 비교, False: 열 비교
+):
+    """
+    행/열 단일선 비교 프리체크.
+    - 균일선(B가 단일값) 스킵
+    - 유효 픽셀 없는 선 스킵
+    - 한 픽셀이라도 |A-B| > tol 이면 False, 모두 ≤ tol 이면 True
+    """
+    # ROI 크기
+    oh = ay.stop - ay.start
+    ow = ax.stop - ax.start
+
+    # 중앙 인덱스 및 탐색 오프셋 순서
+    if use_rows:
+        center = ay.start + oh // 2
+    else:
+        center = ax.start + ow // 2
+
+    # 선 인덱스 시퀀스: 0, ±1, ±2 ... 에서 STEP 스케일
+    offsets = [0]
+    for t in range(1, LINE_ATTEMPTS):
+        offsets.extend([t * LINE_STEP, -t * LINE_STEP])
+
+    for off in offsets:
+        if use_rows:
+            yA = center + off
+            yB = by.start + (yA - ay.start)
+            if not (ay.start <= yA < ay.stop and by.start <= yB < by.stop):
+                continue
+
+            a_line = grayA[yA, ax]
+            b_line = grayB[yB, bx]
+            v_line = validA[yA, ax] & validB[yB, bx]
+            if bezA is not None:
+                v_line &= bezA[yA, ax]
+            if bezB is not None:
+                v_line &= bezB[yB, bx]
+        else:
+            xA = center + off
+            xB = bx.start + (xA - ax.start)
+            if not (ax.start <= xA < ax.stop and bx.start <= xB < bx.stop):
+                continue
+
+            a_line = grayA[ay, xA]
+            b_line = grayB[by, xB]
+            v_line = validA[ay, xA] & validB[by, xB]
+            if bezA is not None:
+                v_line &= bezA[ay, xA]
+            if bezB is not None:
+                v_line &= bezB[by, xB]
+
+        if not np.any(v_line):
+            continue
+
+        # 균일선이면 정보 없음 → 다음 오프셋
+        if np.ptp(b_line[v_line]) == 0:
+            continue
+
+        diff = np.abs(a_line.astype(np.int16) - b_line.astype(np.int16))
+
+        # 이 선이 전부 tol 이내면 프리체크 통과
+        if np.all(diff[v_line] <= tol):
+            return True  # 통과
+        else:
+            return False  # 바로 탈락
+        # 이 선에서 실패해도 다른 오프셋 선을 더 본다
+        # (즉시 False 반환하지 않음)
+
+    # 정보선 못 찾음 → 탈락으로 간주
+    return False
+
+
+def _mini_patch_check(
+    grayA,
+    validA,
+    grayB,
+    validB,
+    ay,
+    ax,
+    by,
+    bx,
+    tol,
+    bezA=None,
+    bezB=None,
+    k=MINI_K,
+):
+    """중앙 k×k 미니패치 모두 ≤ tol 이어야 통과(True). 유효 0이면 실패(False)."""
+    sub = _center_roi_slices(ay, ax, by, bx, k=k)
+    if sub is None:
+        return False
+    Ay, Ax, By, Bx = sub
+    a = grayA[Ay, Ax]
+    b = grayB[By, Bx]
+    v = validA[Ay, Ax] & validB[By, Bx]
+    if bezA is not None:
+        v &= bezA[Ay, Ax]
+    if bezB is not None:
+        v &= bezB[By, Bx]
+    if not np.any(v):
+        return False
+    diff = cv2.absdiff(a, b)
+    return bool(np.all(diff[v] <= tol))
+
+
+def _prelim_pass(
+    grayA,
+    validA,
+    grayB,
+    validB,
+    dx,
+    dy,
+    tol,
+    direction,
+    bezA=None,
+    bezB=None,
+    *,
+    prelim_refine=False,
+):
+    """
+    후보 프리체크: 행/열 단일선 비교 + (옵션) 미니패치 AND
+    direction에 따라 우선축 선택. both인 경우 행→열 순으로 1회 재시도.
+    """
+    H1, W1 = grayA.shape
+    H2, W2 = grayB.shape
+    sl = _overlap_slices(H1, W1, H2, W2, dx, dy)
+    if sl is None:
+        return False
+    ay, ax, by, bx = sl
+
+    def try_axis(use_rows: bool) -> bool:
+        ok_line = _line_precheck(
+            grayA,
+            validA,
+            grayB,
+            validB,
+            ay,
+            ax,
+            by,
+            bx,
+            tol,
+            bezA=bezA,
+            bezB=bezB,
+            use_rows=use_rows,
+        )
+        if not ok_line:
+            return False
+        if prelim_refine:
+            return _mini_patch_check(
+                grayA,
+                validA,
+                grayB,
+                validB,
+                ay,
+                ax,
+                by,
+                bx,
+                tol,
+                bezA=bezA,
+                bezB=bezB,
+                k=MINI_K,
+            )
+        return True
+
+    if direction == "horizontal":
+        if try_axis(use_rows=True):
+            return True
+        # 열로 1회 보조 시도
+        return try_axis(use_rows=False)
+
+    if direction == "vertical":
+        if try_axis(use_rows=False):
+            return True
+        # 행으로 1회 보조 시도
+        return try_axis(use_rows=True)
+
+    # both: 열 우선 → 행 보조
+    if try_axis(use_rows=False):
+        return True
+    return try_axis(use_rows=True)
+
+
 def find_overlap_gray(
     grayA,
     validA,
@@ -195,6 +365,7 @@ def find_overlap_gray(
     progress_cb_refine=None,  # 정밀 계산 진행 콜백
     sample_step=4,
     bezel=(0, 0, 0, 0),
+    prelim_refine=False,
 ):
     """
     완전 브루트포스로 (dx,dy,confidence) 찾기.
@@ -246,9 +417,8 @@ def find_overlap_gray(
     total = len(candidates)
     last_report = -1
 
-    # 1) 중앙 k×k 미니체크
+    # 1) 프리체크(라인 기반 + 옵션 미니패치)
     prelim = []
-    K_CENTER = 5  # 중앙 패치 크기(필요시 3/7로 조정 가능)
     print(f"total: {total}")
     for i, (dx, dy, area) in enumerate(candidates):
 
@@ -259,14 +429,24 @@ def find_overlap_gray(
                 progress_cb(pct)
                 last_report = pct
 
-        # 중앙 k×k에서 한 픽셀이라도 |A-B| > tol 이면 탈락
-        ok = _center_all_within_tol(
-            grayA, validA, grayB, validB, dx, dy, tol, bezA=bezA, bezB=bezB, k=K_CENTER
+        # 후보군 압축
+        ok = _prelim_pass(
+            grayA,
+            validA,
+            grayB,
+            validB,
+            dx,
+            dy,
+            tol,
+            direction,
+            bezA=bezA,
+            bezB=bezB,
+            prelim_refine=prelim_refine,
         )
         if ok:
             prelim.append((dx, dy, area))
 
-    # 2) 미니체크 통과 후보 없음 → 겹침 없음
+    # 2) 프리체크 통과 후보 없음 → 겹침 없음 판단
     if not prelim:
         print("[WARN] NO PRELIM MATCH")
         # direction 기준 안전 오프셋
@@ -275,7 +455,7 @@ def find_overlap_gray(
         else:  # 'vertical' 또는 'both'는 세로로 이어붙임
             return 0, int(H1), 0.0, 0.0, 1.0, True
 
-    # 3) 정밀 계산
+    # 3) 정밀 점수 계산
     final_best = None
     total_refine = len(prelim)
     last_report2 = -1

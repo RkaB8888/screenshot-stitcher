@@ -7,7 +7,7 @@ from .progress import _fmt_hms
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Screenshot Stitcher MVP")
+    parser = argparse.ArgumentParser(description="Screenshot Stitcher")
     parser.add_argument("--input", type=str, help="입력 이미지 폴더 경로")
     parser.add_argument(
         "--output",
@@ -41,15 +41,22 @@ def parse_args():
     parser.add_argument(
         "--sample-step",
         type=int,
-        default=8,
+        default=2,
         help="스코어 계산 시 사용할 그리드 샘플 간격(1이면 전체 픽셀 평가)",
     )
 
     parser.add_argument(
         "--bezel",
         type=str,
-        default="20,20,20,20",  # left,top,right,bottom (px)
+        default="0,0,0,0",  # left,top,right,bottom (px)
         help="베젤(무시) 크기: left,top,right,bottom 픽셀 단위. 예) 8,120,8,0",
+    )
+
+    parser.add_argument(
+        "--prelim-refine",
+        action="store_true",
+        default=False,
+        help="프리체크 단계에서 중앙 k×k 미니패치까지 확인(정밀/느림)",
     )
 
     return parser.parse_args()
@@ -84,6 +91,7 @@ def main():
             slack_frac=args.slack_frac,
             sample_step=args.sample_step,
             bezel=(bz_left, bz_top, bz_right, bz_bottom),
+            prelim_refine=args.prelim_refine,
         )
         t1_match = time.perf_counter()
 

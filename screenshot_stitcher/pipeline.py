@@ -15,6 +15,7 @@ def _accumulate_positions(
     slack_frac,
     sample_step=4,
     bezel=(0, 0, 0, 0),
+    prelim_refine=False,
 ):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     gm = _prep_gray_masks(imgs)
@@ -53,6 +54,7 @@ def _accumulate_positions(
             progress_cb_refine=_cb_refine,  # 정밀 계산 진행률
             sample_step=sample_step,
             bezel=bezel,
+            prelim_refine=prelim_refine,
         )
         dt = time.time() - t0
         if fallback:
