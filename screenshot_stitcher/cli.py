@@ -1,6 +1,7 @@
 # screenshot_stitcher\cli.py
 import os, time, argparse
-from .io_utils import load_images, _read_cv_images
+from pathlib import Path
+from .io_utils import load_images, _read_cv_images, imwrite_unicode
 from .pipeline import _accumulate_positions
 from .stitch import _stitch_all, _stitch_all_distance
 from .progress import _fmt_hms
@@ -12,8 +13,8 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=str,
-        default="stitched.png",
-        help="출력 파일명 (기본: stitched.png)",
+        default=None,
+        help="출력 파일명 (미지정 시 첫 입력 파일명 + _stitched.png)",
     )
     parser.add_argument(
         "--direction",
@@ -80,6 +81,13 @@ def main():
         image_files = load_images(input_dir)
         imgs = _read_cv_images(image_files)
 
+        # ===== 출력 파일명 자동 결정 =====
+        # 사용자가 명시하지 않았다면(기본값 'stitched.png' 그대로라면)
+        # 정렬상 첫 파일명을 기반으로 '<stem>_stitched.png' 로 저장
+        if not args.output:  # 사용자가 미지정
+            first_stem = Path(image_files[0]).stem
+            args.output = f"{first_stem}_stitched.png"
+
         t0_match = time.perf_counter()
         bz_left, bz_top, bz_right, bz_bottom = map(int, args.bezel.split(","))
         positions, gm, pair_confs, pair_scores, pair_norms = _accumulate_positions(
@@ -111,7 +119,7 @@ def main():
 
         import cv2
 
-        ok = cv2.imwrite(out_path, stitched)
+        ok = imwrite_unicode(out_path, stitched)
         if not ok:
             print(f"[ERROR] 저장 실패: {out_path}")
         print(f"[OK] saved -> {out_path}  size={stitched.shape[1]}x{stitched.shape[0]}")

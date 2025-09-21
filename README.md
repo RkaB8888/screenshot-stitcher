@@ -13,6 +13,7 @@
 * 기능:
 
   * 입력 폴더 내 PNG 이미지 자동 로드 및 정렬
+    * Windows 탐색기와 유사한 자연 정렬 키 사용 (숫자/문자 섞여도 직관적 순서 유지)
   * 회색조 + 알파마스크 변환 및 캐싱
   * 브루트포스 기반 겹침 탐색 (`find_overlap_gray`)
 
@@ -26,7 +27,9 @@
 
     * 모든 베젤 값이 0이면 → 단순 덮어쓰기(`_stitch_all`)
     * 하나라도 베젤 > 0이면 → 거리 기반 안티-베젤 스티칭(`_stitch_all_distance`)
-  * 겹친 이미지를 이어붙여 PNG 저장 (`stitched.png`)
+  * 겹친 이미지를 이어붙여 PNG 저장
+    * `--output` 미지정 시: 입력 파일 중 정렬상 첫 파일명을 기반으로 `<이름>_stitched.png` 자동 저장
+    * 유니코드 경로(한글/공백/특수문자) 안전 지원
 
 * CLI 옵션:
 
@@ -59,7 +62,7 @@ screenshot_stitcher/
 실행은 `main.py`를 통해 이루어집니다:
 
 ```bash
-python main.py --input ./images --output stitched.png
+python main.py --input ./images
 ```
 
 ## 로드맵
