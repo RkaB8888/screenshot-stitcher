@@ -19,7 +19,7 @@ def parse_args():
     parser.add_argument(
         "--direction",
         type=str,
-        default="vertical",
+        default="both",
         choices=["both", "vertical", "horizontal"],
         help="겹침 방향 고정 (both/vertical/horizontal)",
     )
@@ -42,14 +42,14 @@ def parse_args():
     parser.add_argument(
         "--sample-step",
         type=int,
-        default=2,
+        default=8,
         help="스코어 계산 시 사용할 그리드 샘플 간격(1이면 전체 픽셀 평가)",
     )
 
     parser.add_argument(
         "--bezel",
         type=str,
-        default="0,0,0,0",  # left,top,right,bottom (px)
+        default="10,10,10,10",  # left,top,right,bottom (px)
         help="베젤(무시) 크기: left,top,right,bottom 픽셀 단위. 예) 8,120,8,0",
     )
 
@@ -58,6 +58,14 @@ def parse_args():
         action="store_true",
         default=False,
         help="프리체크 단계에서 중앙 k×k 미니패치까지 확인(정밀/느림)",
+    )
+
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="v2",
+        choices=["v1", "v2"],
+        help="알고리즘 선택 (v1 / v2)",
     )
 
     return parser.parse_args()
@@ -86,7 +94,10 @@ def main():
         # 정렬상 첫 파일명을 기반으로 '<stem>_stitched.png' 로 저장
         if not args.output:  # 사용자가 미지정
             first_stem = Path(image_files[0]).stem
-            args.output = f"{first_stem}_stitched.png"
+            if args.method == "v2":
+                args.output = f"{first_stem}_stitched_v2.png"
+            else:
+                args.output = f"{first_stem}_stitched.png"
 
         t0_match = time.perf_counter()
         bz_left, bz_top, bz_right, bz_bottom = map(int, args.bezel.split(","))
@@ -100,6 +111,7 @@ def main():
             sample_step=args.sample_step,
             bezel=(bz_left, bz_top, bz_right, bz_bottom),
             prelim_refine=args.prelim_refine,
+            method=args.method,
         )
         t1_match = time.perf_counter()
 

@@ -2,6 +2,7 @@
 import time
 from .preprocess import _prep_gray_masks
 from .overlap import find_overlap_gray
+from .overlap_v2 import get_overlap_offset
 from .progress import _print_progress
 
 
@@ -16,6 +17,7 @@ def _accumulate_positions(
     sample_step=4,
     bezel=(0, 0, 0, 0),
     prelim_refine=False,
+    method="v1",
 ):
     """인접 페어 오프셋 누적 → 각 이미지의 절대좌표 리스트 반환"""
     gm = _prep_gray_masks(imgs)
@@ -41,21 +43,33 @@ def _accumulate_positions(
 
         t0 = time.time()
 
-        dx, dy, conf, score, norm, fallback = find_overlap_gray(
-            grayA,
-            validA,
-            grayB,
-            validB,
-            max_shift_ratio=max_shift_ratio,
-            tol=tol,
-            direction=direction,
-            slack_frac=slack_frac,
-            progress_cb=_cb_match,  # 후보 선별 진행률
-            progress_cb_refine=_cb_refine,  # 정밀 계산 진행률
-            sample_step=sample_step,
-            bezel=bezel,
-            prelim_refine=prelim_refine,
-        )
+        if method == "v1":
+            dx, dy, conf, score, norm, fallback = find_overlap_gray(
+                grayA,
+                validA,
+                grayB,
+                validB,
+                max_shift_ratio=max_shift_ratio,
+                tol=tol,
+                direction=direction,
+                slack_frac=slack_frac,
+                progress_cb=_cb_match,  # 후보 선별 진행률
+                progress_cb_refine=_cb_refine,  # 정밀 계산 진행률
+                sample_step=sample_step,
+                bezel=bezel,
+                prelim_refine=prelim_refine,
+            )
+        elif method == "v2":
+            # 1. 이미지와 베젤 인자를 전달하고 dx, dy를 받음
+            dx, dy, conf, score, norm, fallback = get_overlap_offset(
+                grayA,
+                grayB,
+                bezel=bezel,
+                direction=direction,
+                slack_frac=slack_frac,
+                tol=tol,
+            )
+
         dt = time.time() - t0
         if fallback:
             print("[WARN] fallback used")
